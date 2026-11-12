@@ -25,6 +25,11 @@ import type { BrakeEvent, PanelCtx } from '../ui/types';
 import { Traffic } from './Traffic';
 import { Scenarios, BrakeResult, MooseResult } from './Scenarios';
 import { LapTimer, fmtTime } from './LapTimer';
+import { Debris } from './Debris';
+import { CarDamage } from '../car/CarDamage';
+import type { Impact } from '../physics/Barrier';
+
+const PAINT_RGB = { lava: 0xf2b200, pearl: 0xeef0f2 } as const;
 
 export type Mode = 'menu' | 'showcase' | 'drive';
 
@@ -63,6 +68,9 @@ export class Game {
   car: CarModel;
   refCar: CarModel | null = null;
   rig3: SuspensionRig;
+  damage: CarDamage;
+  debris: Debris;
+  private sdTmp = { s: 0, d: 0 };
   player = new Vehicle({ emb: DEFAULTS.emb, active: DEFAULTS.activeSusp });
   ref = new Vehicle({ emb: false, active: false });
   ghostVisible = false;
@@ -172,6 +180,14 @@ export class Game {
     this.car = new CarModel();
     this.scene.add(this.car.root);
     this.rig3 = new SuspensionRig(this.car);
+    this.damage = new CarDamage(this.car);
+    this.debris = new Debris((x, z, sHint) => {
+      road.worldToSD(x, z, sHint, this.sdTmp);
+      const { s, d } = this.sdTmp;
+      // road, curbs and verges are the road surface; beyond them the terrain mesh
+      return { y: Math.abs(d) <= 22 ? road.height(s, d) : this.terrain.heightAt(x, z), s, d };
+    }, PAINT_RGB[this.paint]);
+    this.world.add(this.debris.group);
 
     // camera / ui
     this.camera.aspect = window.innerWidth / window.innerHeight;
@@ -251,7 +267,21 @@ export class Game {
     this.bloom.strength = world ? 0.45 : 0.22;
   }
 
+  /** a new car: undo body damage, torn parts go back on (fragments and bent rails stay where they are) */
+  private newCar() {
+    this.damage.repair();
+    this.debris.clearParts();
+  }
+
+  /** fresh session: the track is clean again */
+  private cleanTrack() {
+    this.newCar();
+    this.debris.clear();
+    this.track.repairArmco();
+  }
+
   enterMenu() {
+    this.cleanTrack();
     this.mode = 'menu';
     this.setWorldVisible(false);
     this.hud.setMenu(true);
@@ -321,6 +351,7 @@ export class Game {
     if (is(KEYS.xray)) { this.setXray(!this.xray); return; }
     if (is(KEYS.paint)) {
       this.paint = this.paint === 'lava' ? 'pearl' : 'lava';
+      this.debris.setPaint(PAINT_RGB[this.paint]);
       this.car.setPaint(this.paint);
       if (this.mode === 'drive') this.hud.toast(`涂装：${this.paint === 'lava' ? '熔岩黄' : '珍珠白 + 黄色条纹'}`);
       return;
@@ -377,6 +408,7 @@ export class Game {
 
   // ------------------------------------------------------------------ resets / teleports
   resetAll(start = false) {
+    this.cleanTrack();
     this.acc = 0;
     this.player.reset(start ? 6 : this.player.s, start ? 0 : this.player.laneIdx, 0);
     this.ref.reset(this.player.s, 0, 0);
@@ -387,6 +419,7 @@ export class Game {
   }
 
   resetToCheckpoint() {
+    this.newCar();
     const p = this.player;
     const cp = Math.floor(p.s / 500) * 500;
     const crashed = p.crashed;
@@ -400,6 +433,7 @@ export class Game {
   }
 
   teleportBrakeTest() {
+    this.newCar();
     const p = this.player;
     const s = this.scen.zoneStart + 5;
     this.traffic.clearArea(s, 200, 900);
@@ -413,6 +447,7 @@ export class Game {
   }
 
   teleportMoose() {
+    this.newCar();
     const p = this.player;
     const s = this.scen.mooseStart - 150;
     this.traffic.clearArea(s, 200, 600);
@@ -733,7 +768,7 @@ export class Game {
     return {
       section: road.sectionAt(p.s).name,
       lapTime: this.lap.lapTime, bestLap: this.lap.bestLap, lastLap: this.lap.lastLap, penalty: this.lap.penalty, laps: this.lap.laps,
-      kmh: p.v * 3.6, powerKW: p.tel.powerKW, throttle: this.throttle, brake: this.brake,
+      kmh: Math.abs(p.v) * 3.6, powerKW: p.tel.powerKW, throttle: this.throttle, brake: this.brake,
       ayG: p.tel.ayG, axG: p.tel.axG, emb: p.opts.emb, active: p.opts.active, ghost: this.ghostVisible, xray: this.xray,
       cam: CAM_NAMES[this.rig.mode], paint: this.paint === 'lava' ? '熔岩黄' : '珍珠白', overspeed: this.overspeedLevel,
       advisedKmh: this.advised, crashed: p.crashed, inBrakeZone: this.scen.inBrakeZone(p.s), fps: this.fps,
@@ -763,6 +798,8 @@ export class Game {
         steps++;
       }
       if (steps >= 16) this.acc %= PHYS_DT;
+      this.handleImpacts();
+      this.debris.update(dt);
       this.hud.update(this.hudState(), this.panelCtx(), dt);
     }
     this.updateQuality(dt);
@@ -778,6 +815,40 @@ export class Game {
         this.syncVisuals(true);
         this.sampleGaps();
       }
+      if (this.player.impacts.length) this.handleImpacts();
     }
+  }
+
+  // ------------------------------------------------------------------ crash damage
+  private tmpW = { o: new THREE.Vector3(), f: new THREE.Vector3(), l: new THREE.Vector3(), n: new THREE.Vector3() };
+
+  /** turn the physics' barrier impacts into visible damage, debris, a bent rail and feedback */
+  private handleImpacts() {
+    this.ref.impacts.length = 0; // the ghost car only shows the reference run, it does not get damaged
+    const list = this.player.impacts.splice(0);
+    if (!list.length) return;
+    this.syncCar(this.car, this.player);
+    for (const im of list) this.applyImpact(im);
+  }
+
+  private applyImpact(im: Impact) {
+    const torn = this.damage.apply(im);
+    this.track.bendArmco(im.s, im.side, im.railBend);
+    // world-space contact point and velocities
+    const w = this.tmpW;
+    road.frame(im.s, 0, w.o, w.f, w.l, w.n);
+    const at = this.car.root.localToWorld(new THREE.Vector3(im.x, 0.55, -im.yL));
+    const intoTrack = w.l.clone().multiplyScalar(-im.side);
+    const base = w.f.clone().multiplyScalar(0.85 * im.slideSpeed).addScaledVector(w.l, 0.2 * im.vD);
+    const spray = intoTrack.multiplyScalar(1 + 0.35 * im.normalSpeed);
+    for (const part of torn) {
+      const v = base.clone().addScaledVector(spray, 0.5 + Math.random()).add(new THREE.Vector3(0, 2 + Math.random() * 3, 0));
+      this.debris.addPart(part, v, im.s);
+    }
+    const n = Math.round(Math.min(40, Math.max(2, im.energyJ / 2500)));
+    this.debris.spawnFragments(n, at, base, spray, im.energyJ > 25e3 ? [0, 1, 0, 1, 2] : [0, 1], im.s);
+    if (im.wrecked) this.hud.toast(`严重撞击 · 车辆报废（吸收 ${(im.energyJ / 1000).toFixed(0)} kJ）`, 'warn', 4000);
+    else if (im.energyJ > 15e3) this.notify(`撞击护栏 · 车身受损（${(im.energyJ / 1000).toFixed(0)} kJ）`, 'warn');
+    else this.notify('擦碰护栏', 'warn');
   }
 }

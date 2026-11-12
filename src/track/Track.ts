@@ -49,6 +49,8 @@ export class Track {
   group = new THREE.Group();
   roadGroup = new THREE.Group();
   props = new THREE.Group();
+  /** Armco segments with per-vertex track position, so impacts can bend the rail where they happen */
+  private armco: { mesh: THREE.Mesh; s0: number; s1: number; vs: Float32Array; side: Int8Array; orig: Float32Array; bent: boolean }[] = [];
   rs = road;
 
   constructor() {
@@ -117,6 +119,51 @@ export class Track {
     }
   }
 
+  /**
+   * Permanently bend the Armco outwards after an impact: `depth` metres at s, fading along the rail over a
+   * length that grows with the depth (a hard hit drags more of the rail and its posts with it).
+   */
+  bendArmco(s: number, side: 1 | -1, depth: number) {
+    if (depth < 0.005) return;
+    const L = this.rs.length;
+    const span = 1.2 + 4 * depth;
+    for (const seg of this.armco) {
+      const ds0 = ((s - seg.s0 + L / 2) % L + L) % L - L / 2, ds1 = ((s - seg.s1 + L / 2) % L + L) % L - L / 2;
+      if (ds0 < -3 * span || ds1 > 3 * span) continue;
+      const a = seg.mesh.geometry.attributes.position as THREE.BufferAttribute;
+      let touched = false;
+      for (let i = 0; i < a.count; i++) {
+        if (seg.side[i] !== side) continue;
+        let dd = seg.vs[i] - s;
+        dd = ((dd + L / 2) % L + L) % L - L / 2;
+        if (Math.abs(dd) > 3 * span) continue;
+        const push = depth * Math.exp(-((dd / span) ** 2));
+        const sv = seg.vs[i];
+        a.setXYZ(i, a.getX(i) + this.rs.lxAt(sv) * side * push, a.getY(i) - 0.15 * push, a.getZ(i) + this.rs.lzAt(sv) * side * push);
+        touched = true;
+      }
+      if (touched) {
+        a.needsUpdate = true;
+        seg.mesh.geometry.computeVertexNormals();
+        seg.mesh.geometry.computeBoundingSphere();
+        seg.bent = true;
+      }
+    }
+  }
+
+  /** straighten every bent rail (new session) */
+  repairArmco() {
+    for (const seg of this.armco) {
+      if (!seg.bent) continue;
+      const a = seg.mesh.geometry.attributes.position as THREE.BufferAttribute;
+      (a.array as Float32Array).set(seg.orig);
+      a.needsUpdate = true;
+      seg.mesh.geometry.computeVertexNormals();
+      seg.mesh.geometry.computeBoundingSphere();
+      seg.bent = false;
+    }
+  }
+
   private buildArmco() {
     const rs = this.rs;
     const L = rs.length;
@@ -126,6 +173,7 @@ export class Track {
     for (let s0 = 0; s0 < L; s0 += 240) {
       const s1 = Math.min(L, s0 + 240);
       const rails: THREE.BufferGeometry[] = [];
+      const vs: number[] = [], vside: number[] = [];
       for (const sgn of [-1, 1]) {
         for (const hRail of [0.52, 0.86]) {
           const pos: number[] = [];
@@ -140,6 +188,7 @@ export class Track {
             for (const [off, h] of profile) {
               const dd = -sgn * off; // toward the road = -sgn direction
               pos.push(p.x + lx * dd, p.y + hRail + h, p.z + lz * dd);
+              vs.push(s); vside.push(sgn);
             }
           }
           const nv = profile.length;
@@ -160,6 +209,7 @@ export class Track {
       const m = new THREE.Mesh(g, mat);
       m.castShadow = false;
       this.props.add(m);
+      this.armco.push({ mesh: m, s0, s1, vs: new Float32Array(vs), side: Int8Array.from(vside), orig: new Float32Array(g.attributes.position.array as Float32Array), bent: false });
     }
     // posts
     const postGeo = new THREE.BoxGeometry(0.12, 1.15, 0.14);

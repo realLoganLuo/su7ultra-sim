@@ -182,7 +182,7 @@ export class Hud {
       chip('透视', s.xray ? '开' : '关', s.xray) +
       chip('镜头', s.cam) +
       chip('涂装', s.paint);
-    if (s.crashed) { e.warn.style.display = 'block'; e.warn.textContent = '冲出赛道！按 R 重置'; }
+    if (s.crashed) { e.warn.style.display = 'block'; e.warn.textContent = '车辆严重损坏！按 R 重置'; }
     else if (s.overspeed > 0) { e.warn.style.display = 'block'; e.warn.textContent = s.overspeed === 2 ? `弯道超速！ 建议 ≤ ${s.advisedKmh.toFixed(0)} km/h` : `弯道注意减速 · 建议 ≤ ${s.advisedKmh.toFixed(0)} km/h`; e.warn.style.background = s.overspeed === 2 ? 'rgba(210,30,30,.85)' : 'rgba(210,130,20,.85)'; }
     else e.warn.style.display = 'none';
     e.fps.textContent = s.fps > 0 ? `${s.fps.toFixed(0)} fps` : '';
