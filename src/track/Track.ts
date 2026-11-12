@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { road, RoadSurface } from './roadSurface';
 import { TRACK_CFG } from '../config';
 import { asphaltTexture, grassTexture, curbTexture, signTexture, graffitiTextures } from './textures';
@@ -88,20 +89,31 @@ export class Track {
     const uvCurb: UVFn = (s, d) => [Math.abs(d) > 0 ? (Math.abs(d) - hw) / 1.4 : 0, s / 3];
     const uvGrass: UVFn = (s, d) => [d / 12, s / 12];
 
+    // One mesh per material per chunk: left and right curbs / grass share the same s-range, so merging
+    // them halves their draw calls without coarsening frustum culling.
+    const merged = (parts: THREE.BufferGeometry[]) => {
+      const g = mergeGeometries(parts)!;
+      parts.forEach((x) => x.dispose());
+      g.computeBoundingSphere();
+      return g;
+    };
     for (const ch of this.chunks()) {
       const m = new THREE.Mesh(buildRibbon(rs, ch.s0, ch.s1, roadCols, uvRoad, 0), ch.concrete ? concrete : asphalt);
       m.receiveShadow = true;
       this.roadGroup.add(m);
+      const curbs: THREE.BufferGeometry[] = [], grasses: THREE.BufferGeometry[] = [];
       for (const sgn of [-1, 1]) {
         const cols = sgn > 0 ? [hw, (hw + TRACK_CFG.curbOuter) / 2, TRACK_CFG.curbOuter] : [-TRACK_CFG.curbOuter, -(hw + TRACK_CFG.curbOuter) / 2, -hw];
-        const cm = new THREE.Mesh(buildRibbon(rs, ch.s0, ch.s1, cols, uvCurb, 0.004), curb);
-        cm.receiveShadow = true;
-        this.roadGroup.add(cm);
+        curbs.push(buildRibbon(rs, ch.s0, ch.s1, cols, uvCurb, 0.004));
         const gcols = sgn > 0 ? [TRACK_CFG.curbOuter, 9, 12, 16, 22] : [-22, -16, -12, -9, -TRACK_CFG.curbOuter];
-        const gm = new THREE.Mesh(buildRibbon(rs, ch.s0, ch.s1, gcols, uvGrass, -0.003, 2), grass);
-        gm.receiveShadow = true;
-        this.roadGroup.add(gm);
+        grasses.push(buildRibbon(rs, ch.s0, ch.s1, gcols, uvGrass, -0.003, 2));
       }
+      const cm = new THREE.Mesh(merged(curbs), curb);
+      cm.receiveShadow = true;
+      this.roadGroup.add(cm);
+      const gm = new THREE.Mesh(merged(grasses), grass);
+      gm.receiveShadow = true;
+      this.roadGroup.add(gm);
     }
   }
 
@@ -110,9 +122,11 @@ export class Track {
     const L = rs.length;
     const mat = new THREE.MeshStandardMaterial({ color: 0xb9c0c7, metalness: 0.65, roughness: 0.42, side: THREE.DoubleSide });
     const profile: [number, number][] = [[0.0, 0.3], [-0.04, 0.2], [0.0, 0.1], [0.03, 0.0], [0, -0.1], [-0.04, -0.2], [0, -0.3]]; // (toward road, height)
-    for (const sgn of [-1, 1]) {
-      for (let s0 = 0; s0 < L; s0 += 240) {
-        const s1 = Math.min(L, s0 + 240);
+    // both rails on both sides of a 240 m segment become one mesh (one draw call instead of four)
+    for (let s0 = 0; s0 < L; s0 += 240) {
+      const s1 = Math.min(L, s0 + 240);
+      const rails: THREE.BufferGeometry[] = [];
+      for (const sgn of [-1, 1]) {
         for (const hRail of [0.52, 0.86]) {
           const pos: number[] = [];
           const idx: number[] = [];
@@ -137,11 +151,15 @@ export class Track {
           g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
           g.setIndex(idx);
           g.computeVertexNormals();
-          const m = new THREE.Mesh(g, mat);
-          m.castShadow = false;
-          this.props.add(m);
+          rails.push(g);
         }
       }
+      const g = mergeGeometries(rails)!;
+      rails.forEach((x) => x.dispose());
+      g.computeBoundingSphere();
+      const m = new THREE.Mesh(g, mat);
+      m.castShadow = false;
+      this.props.add(m);
     }
     // posts
     const postGeo = new THREE.BoxGeometry(0.12, 1.15, 0.14);
