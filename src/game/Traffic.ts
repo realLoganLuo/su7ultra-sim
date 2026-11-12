@@ -1,13 +1,34 @@
 import * as THREE from 'three';
 import { road } from '../track/roadSurface';
 import { surfaceLocalY } from '../car/wheelContact';
+import { TRACK_CFG, G, CAR } from '../config';
+import { collide, RigidState, CAR_CONTACT } from '../physics/CarContact';
+import type { Vehicle } from '../physics/Vehicle';
+import type { Impact } from '../physics/Barrier';
 
+/**
+ * A traffic car. While cruising it follows its lane kinematically. After a hit it is a rigid body
+ * (two-axle model with saturating tyres): it slides and spins under its tyre forces while the driver
+ * brakes, steers back to the lane once it has it under control, and resumes speed. A heavy hit wrecks it:
+ * it brakes to a stop and stays there.
+ */
 export interface TrafficCar {
-  s: number; d: number; v: number;
+  s: number; d: number;
+  /** forward (body-frame) speed */
+  v: number;
   mesh: THREE.Group;
   wheels: THREE.Mesh[];
   hitTimer: number;
+  yaw: number; w: number; r: number; // heading from the road tangent, lateral body speed, yaw rate
+  lane: number; cruiseV: number;
+  mode: 'cruise' | 'loose' | 'wrecked';
+  damageJ: number;
+  touching: boolean;
+  /** deformation energy of an ongoing contact not yet reported as an impact */
+  pendingJ: number;
 }
+
+export const TRAFFIC_BODY = { m: 1500, I: 2900, hx: 2.25, hy: 0.91, a: 1.35, b: 1.35, C: 70000, mu: 1.0, wreckJ: 40e3 };
 
 export interface Cone {
   s: number; d: number;
@@ -70,7 +91,9 @@ export class Traffic {
       const car: TrafficCar = {
         s: Math.max(s, 400), d: [-4, 0, 4][Math.floor(r() * 3)], v: (60 + r() * 55) / 3.6,
         mesh: tm.group, wheels: tm.wheels, hitTimer: 0,
+        yaw: 0, w: 0, r: 0, lane: 0, cruiseV: 0, mode: 'cruise', damageJ: 0, touching: false, pendingJ: 0,
       };
+      car.lane = car.d; car.cruiseV = car.v;
       this.cars.push(car);
       this.group.add(car.mesh);
     }
@@ -165,10 +188,25 @@ export class Traffic {
     c.t = 0;
   }
 
+  /** back to normal traffic (new session) */
+  repair() {
+    for (const c of this.cars) { c.mode = 'cruise'; c.d = c.lane; c.v = c.cruiseV; c.yaw = c.w = c.r = 0; c.damageJ = 0; c.hitTimer = 0; c.touching = false; c.pendingJ = 0; }
+  }
+
   update(dt: number) {
     for (const car of this.cars) {
-      car.s = road.wrap(car.s + car.v * dt);
       if (car.hitTimer > 0) car.hitTimer -= dt;
+      if (car.mode === 'cruise') {
+        car.v += Math.max(-2 * dt, Math.min(2 * dt, car.cruiseV - car.v)); // back up to speed after a bump
+        car.s = road.wrap(car.s + car.v * dt);
+        car.d += Math.max(-1.5 * dt, Math.min(1.5 * dt, car.lane - car.d));
+        continue;
+      }
+      for (let k = 0; k < 2; k++) this.looseStep(car, dt / 2);
+      // regained control: straight, slow yaw, near its lane
+      if (car.mode === 'loose' && Math.abs(car.yaw) < 0.05 && Math.abs(car.r) < 0.08 && Math.abs(car.w) < 0.4 && Math.abs(car.d - car.lane) < 0.5) {
+        car.mode = 'cruise'; car.yaw = 0; car.w = 0; car.r = 0;
+      }
     }
     let dirty = false;
     for (let i = 0; i < this.cones.length; i++) {
@@ -176,6 +214,62 @@ export class Traffic {
       if (c.hit && c.t < 3) { c.t += dt; this.writeCone(i); dirty = true; }
     }
     if (dirty) this.coneMesh.instanceMatrix.needsUpdate = true;
+  }
+
+  /** rigid-body step of a car that is not simply cruising */
+  private looseStep(car: TrafficCar, h: number) {
+    const B = TRAFFIC_BODY;
+    const u = car.v;
+    // driver: brake (harder when wrecked), steer back to the lane once the car is pointing roughly forward
+    const brakeG = car.mode === 'wrecked' ? 0.9 : Math.abs(car.yaw) > 0.25 || Math.abs(car.r) > 0.3 ? 0.6 : 0.15;
+    const steer = car.mode === 'loose' && Math.abs(car.yaw) < 0.6 && u > 3
+      ? Math.max(-0.35, Math.min(0.35, 0.05 * (car.lane - car.d) - 0.8 * car.yaw - 0.25 * car.r - 0.03 * car.w))
+      : 0;
+    const fz = (B.m * G) / 2;
+    let fx: number, fyF: number, fyR: number;
+    if (car.mode === 'wrecked' || Math.abs(car.yaw) > 0.6) {
+      // brakes locked (or a wrecked car's wheels jammed): each axle slides, and its friction opposes that
+      // axle's own sliding velocity; the front / rear difference is what damps the spin
+      const vF = Math.hypot(u, car.w + B.a * car.r), vR = Math.hypot(u, car.w - B.b * car.r);
+      const kF = vF > 0.05 ? (B.mu * fz) / vF : 0, kR = vR > 0.05 ? (B.mu * fz) / vR : 0;
+      fx = -(kF + kR) * u;
+      fyF = -kF * (car.w + B.a * car.r);
+      fyR = -kR * (car.w - B.b * car.r);
+    } else {
+      const fxMax = B.mu * B.m * G;
+      fx = Math.abs(u) > 0.3 ? -Math.sign(u) * Math.min(fxMax * 0.95, brakeG * B.m * G) : -u * B.m / h * 0.5;
+      const lat = Math.sqrt(Math.max(0, 1 - (fx / fxMax) ** 2)); // friction circle (ABS keeps the wheels turning)
+      const lim = B.mu * fz * lat;
+      const cd = Math.cos(steer), sd = Math.sin(steer);
+      const vyF = car.w + B.a * car.r;
+      const af = Math.abs(u) + Math.abs(vyF) < 0.3 ? 0 : -Math.atan2(vyF * cd - u * sd, Math.abs(u * cd + vyF * sd));
+      const ar = Math.abs(u) + Math.abs(car.w) < 0.3 ? 0 : -Math.atan2(car.w - B.b * car.r, Math.abs(u));
+      fyF = lim * Math.tanh((B.C * af) / Math.max(1, lim)); fyR = lim * Math.tanh((B.C * ar) / Math.max(1, lim));
+    }
+    const cor = car.w * car.r;
+    car.w += h * ((fyF + fyR) / B.m - u * car.r);
+    car.v += h * (fx / B.m + cor);
+    car.r += h * (B.a * fyF - B.b * fyR) / B.I;
+    if (Math.abs(car.v) < 0.05 && Math.abs(car.w) < 0.05) { car.v = 0; car.w = 0; car.r *= 0.9; }
+    // pose in road coordinates
+    const cy = Math.cos(car.yaw), sy = Math.sin(car.yaw);
+    const kap = road.curvature(car.s);
+    const dsdt = (car.v * cy - car.w * sy) / Math.max(0.25, 1 - kap * car.d);
+    car.yaw += (car.r - kap * dsdt) * h;
+    car.yaw = Math.atan2(Math.sin(car.yaw), Math.cos(car.yaw));
+    car.d += (car.v * sy + car.w * cy) * h;
+    car.s = road.wrap(car.s + dsdt * h);
+    // the Armco stops it (inelastic, scraping)
+    const lim2 = TRACK_CFG.armcoD - (B.hx * Math.abs(sy) + B.hy * Math.abs(cy));
+    if (Math.abs(car.d) > lim2) {
+      car.d = Math.sign(car.d) * lim2;
+      const vd = car.v * sy + car.w * cy, vs = car.v * cy - car.w * sy;
+      if (vd * Math.sign(car.d) > 0) { // remove the motion into the rail, keep a scraped share of the rest
+        const vs2 = vs * 0.8;
+        car.v = vs2 * cy; car.w = -vs2 * sy;
+        car.r *= 0.5;
+      }
+    }
   }
 
   syncMeshes() {
@@ -186,13 +280,57 @@ export class Traffic {
       const right = new THREE.Vector3().crossVectors(f, n);
       m.makeBasis(f, n, right);
       car.mesh.quaternion.setFromRotationMatrix(m);
+      if (car.yaw !== 0) car.mesh.quaternion.premultiply(new THREE.Quaternion().setFromAxisAngle(n, car.yaw));
       car.mesh.position.copy(o);
       car.mesh.updateMatrixWorld(true);
       // every tyre sits on the real road surface (1 cm embedded = static deflection)
       for (const w of car.wheels) w.position.y = surfaceLocalY(car.mesh, car.s, w.position.x, w.position.z) + 0.33 - 0.01;
-      car.mesh.visible = car.hitTimer <= 0 || Math.floor(car.hitTimer * 8) % 2 === 0;
     }
   }
+}
+
+/**
+ * Rigid-body contact between the player's car and a traffic car: impulse, overlap removal, and the
+ * deformation energy split equally between the two crush zones. A new contact (or a hard one) is
+ * registered as an impact on the player (damage, wheels, debris). Returns null if they do not touch.
+ */
+export function playerVsTraffic(p: Vehicle, car: TrafficCar, ds: number): { impact: Impact | null; energyJ: number; fresh: boolean } | null {
+  if (Math.abs(ds) > 9 || Math.abs(car.d - p.d) > 6) { car.touching = false; return null; }
+  const [pvS, pvD] = p.roadVelocity();
+  const A: RigidState = { s: 0, d: p.d, yaw: p.yaw, vS: pvS, vD: pvD, w: p.yawRate, m: CAR.mass, I: CAR.yawInertia, hx: 2.6, hy: 1.03, cx: 0.05 };
+  const cy = Math.cos(car.yaw), sy = Math.sin(car.yaw);
+  const TB = TRAFFIC_BODY;
+  const B: RigidState = { s: ds, d: car.d, yaw: car.yaw, vS: car.v * cy - car.w * sy, vD: car.v * sy + car.w * cy, w: car.r, m: TB.m, I: TB.I, hx: TB.hx, hy: TB.hy, cx: 0 };
+  const hit = collide(A, B, ds);
+  // positions (overlap removed even without an impulse)
+  p.shift(A.s, A.d - p.d);
+  car.s = road.wrap(car.s + (B.s - ds)); car.d = B.d;
+  if (!hit) { if (Math.abs(ds) > 6) car.touching = false; return null; }
+  p.applyImpulse(hit.jn * hit.nS - hit.jt * hit.nD, hit.jn * hit.nD + hit.jt * hit.nS, hit.rAS, hit.rAD);
+  car.v = B.vS * cy + B.vD * sy; car.w = -B.vS * sy + B.vD * cy; car.r = B.w;
+  if (car.mode === 'cruise') car.mode = 'loose';
+  const half = hit.energyJ / 2;
+  car.damageJ += half;
+  if (car.damageJ > TB.wreckJ) car.mode = 'wrecked';
+  const fresh = !car.touching;
+  car.touching = true;
+  // A sustained push is many small impulses: report a new impact (damage, debris) for the first touch
+  // and then for every 6 kJ the ongoing contact has absorbed.
+  car.pendingJ += half;
+  if (!fresh && car.pendingJ < 6e3) return { impact: null, energyJ: half, fresh };
+  const reported = car.pendingJ;
+  car.pendingJ = 0;
+  const pc = Math.cos(p.yaw), ps = Math.sin(p.yaw);
+  const impact = p.registerImpact({
+    corner: -1,
+    x: hit.rAS * pc + hit.rAD * ps, yL: -hit.rAS * ps + hit.rAD * pc,
+    nx: hit.nS * pc + hit.nD * ps, nyL: -hit.nS * ps + hit.nD * pc,
+    normalSpeed: hit.closing, energyJ: reported,
+    penetration: hit.pen, bodyCrush: Math.min(0.5, Math.sqrt((reported * 2) / CAR_CONTACT.kBody)), railBend: 0,
+    s: road.wrap(p.s + hit.rAS), side: hit.nD >= 0 ? -1 : 1, slideSpeed: pvS, vS: pvS, vD: pvD,
+    kind: 'car', nS: hit.nS, nD: hit.nD,
+  });
+  return { impact, energyJ: half, fresh };
 }
 
 function mergeTwo(a: THREE.BufferGeometry, b: THREE.BufferGeometry): THREE.BufferGeometry {
