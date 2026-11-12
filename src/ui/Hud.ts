@@ -53,8 +53,10 @@ export class Hud {
         <div class="sec" data-k="sec">起点 · T13</div>
         <div class="lap" data-k="lap"></div>
       </div>
-      <div class="hud-chips" data-k="chips"></div>
-      <div class="orbit-hint" data-k="ohint">鼠标拖动 360° 查看 · 滚轮缩放 · 双击 / C 回追尾</div>
+      <div class="hud-top">
+        <div class="hud-chips" data-k="chips"></div>
+        <div class="orbit-hint" data-k="ohint">鼠标拖动 360° 查看 · 滚轮缩放 · 双击 / C 回追尾</div>
+      </div>
       <div class="toasts" data-k="toasts"></div>
       <div class="warn-banner" data-k="warn"></div>
       <div class="hud-speed">
@@ -69,9 +71,11 @@ export class Hud {
       </div>
       <div class="panel result" data-k="result"></div>
       <div class="hud-right" data-k="right"></div>
-      <div class="showcase-hint" data-k="hint"><b>展示模式</b> · 鼠标拖动旋转 / 滚轮缩放 · <b>P</b> 切换涂装 · <b>X</b> 透视悬架 · <b>Esc</b> 返回菜单</div>
       <div class="loading" data-k="loading"><div class="lb"><i data-k="lbar"></i></div><span data-k="ltxt">正在加载真实车模…</span></div>
-      <div class="credit" data-k="credit">车模：<a>Xiaomi SU7 Ultra Nürburgring</a> by MattDoesBlender · CC-BY-4.0 (sketchfab.com/3d-models/xiaomi-su7-ultra-nurburgring-df6d8c7af9764d31a4ecef61925c13bb)</div>
+      <div class="bottom-dock">
+        <div class="showcase-hint" data-k="hint"><b>展示模式</b> · 鼠标拖动旋转 / 滚轮缩放 · <b>P</b> 切换涂装 · <b>X</b> 透视悬架 · <b>Esc</b> 返回菜单</div>
+        <div class="credit" data-k="credit">车模：<a>Xiaomi SU7 Ultra Nürburgring</a> by MattDoesBlender · CC-BY-4.0 (sketchfab.com/3d-models/xiaomi-su7-ultra-nurburgring-df6d8c7af9764d31a4ecef61925c13bb)</div>
+      </div>
       <div class="fps" data-k="fps"></div>
       <div class="menu" data-k="menu">
         <div class="card">

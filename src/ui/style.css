@@ -25,7 +25,9 @@
 .hud-tl .lap b { font-size: 22px; }
 
 /* status chips top right (left of panels) */
-.hud-chips { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; max-width: 60vw; }
+/* chips and the orbit hint share one centred column, so wrapped chip rows push the hint down instead of covering it */
+.hud-top { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: 60vw; }
+.hud-chips { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
 .chip { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 4px 11px; font-size: 12px; white-space: nowrap; }
 .chip b { color: var(--acc); font-weight: 600; }
 .chip.on b { color: var(--cy); }
@@ -55,7 +57,8 @@
 .hud-g .gt { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--dim); }
 
 /* right column */
-.hud-right { position: absolute; right: 14px; top: 14px; width: 292px; display: flex; flex-direction: column; gap: 10px; max-height: calc(100vh - 28px); overflow: hidden; }
+/* bottom 78px stay free for the model credit (up to 3 lines at bottom: 22px) */
+.hud-right { position: absolute; right: 14px; top: 14px; width: 292px; display: flex; flex-direction: column; gap: 10px; max-height: calc(100vh - 92px); overflow: hidden; }
 .hud-right .panel { pointer-events: none; }
 .wheelbars { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; height: 74px; align-items: end; margin: 6px 0 2px; }
 .wb { position: relative; height: 100%; background: rgba(255,255,255,.07); border-radius: 4px; overflow: hidden; border: 1px solid transparent; }
@@ -99,18 +102,20 @@ canvas.graph { width: 100%; height: 66px; display: block; background: rgba(0,0,0
 .menu button.primary { background: var(--acc); color: #1a1400; border-color: var(--acc); font-weight: 700; }
 .menu button:hover { filter: brightness(1.15); }
 .menu .note { margin-top: 12px; font-size: 11.5px; color: var(--dim); line-height: 1.5; }
-.showcase-hint { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); font-size: 13px; color: var(--dim); display: none; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 14px; }
+/* hint and model credit share one bottom column so they stack instead of overlapping at any width */
+.bottom-dock { position: absolute; left: 8px; right: 8px; bottom: 22px; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.showcase-hint { max-width: 100%; box-sizing: border-box; text-align: center; font-size: 13px; color: var(--dim); display: none; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 14px; }
 .showcase-hint b { color: var(--txt); }
 .fps { position: absolute; right: 8px; bottom: 6px; font-size: 11px; color: var(--dim); }
-@media (max-width: 1100px) { .hud-help { display: none; } .hud-right { width: 250px; } }
+@media (max-width: 1100px) { .hud-help { display: none; } .hud-right { width: 250px; } .hud-top { max-width: calc(100vw - 2 * (250px + 14px + 12px)); } .chip { font-size: 11px; padding: 3px 9px; } .hud-chips { gap: 6px; } }
 
 .loading { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); display: none; align-items: center; gap: 10px; font-size: 13px; background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 6px 16px; z-index: 5; }
 .loading .lb { width: 120px; height: 6px; background: rgba(255,255,255,.15); border-radius: 3px; overflow: hidden; }
 .loading .lb i { display: block; height: 100%; width: 0; background: var(--acc); }
-.credit { position: absolute; right: 8px; bottom: 22px; max-width: 46vw; text-align: right; font-size: 10px; line-height: 1.35; color: rgba(255,255,255,.45); text-shadow: 0 1px 2px rgba(0,0,0,.8); }
+.credit { align-self: flex-end; max-width: min(46vw, calc(50vw - 150px)); /* stay right of the centred speedometer */ text-align: right; font-size: 10px; line-height: 1.35; color: rgba(255,255,255,.45); text-shadow: 0 1px 2px rgba(0,0,0,.8); }
 .menu a { color: var(--acc); text-decoration: none; }
 .menu a:hover { text-decoration: underline; }
 
-.orbit-hint { position: absolute; left: 50%; top: 52px; transform: translateX(-50%); font-size: 11.5px; color: rgba(255,255,255,.6); background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 2px 12px; white-space: nowrap; }
+.orbit-hint { font-size: 11.5px; color: rgba(255,255,255,.6); background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 2px 12px; white-space: nowrap; }
 canvas#app { cursor: grab; touch-action: none; }
 canvas#app:active { cursor: grabbing; }
