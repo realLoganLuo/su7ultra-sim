@@ -46,4 +46,19 @@ export interface Impact {
   /** contact-point velocity along the rail and the car's CG velocity in the road frame [m/s] */
   slideSpeed: number; vS: number; vD: number;
   wrecked: boolean;
+  /** what was hit, and the contact normal in the road frame pointing into the car (for debris) */
+  kind: 'barrier' | 'car';
+  nS: number; nD: number;
+  /** wheels this impact tore off */
+  detached: number[];
 }
+
+/** wheel damage thresholds: local impact energy at a wheel bends it ~1 rad per BEND_J, tears it off past DETACH_J */
+export const WHEEL_DAMAGE = {
+  reach: 2.0, // m: impact energy reaches wheels within this distance of the contact point (linear fall-off)
+  bendJ: 450e3,
+  detachJ: 70e3,
+  /** past these the car cannot be driven (steering arm / suspension broken) */
+  maxToe: 0.1,
+  maxCamber: 0.12,
+};

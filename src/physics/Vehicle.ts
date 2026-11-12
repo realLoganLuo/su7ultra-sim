@@ -7,7 +7,7 @@ import { ActiveSuspension } from './ActiveSuspension';
 import { BrakeByWire } from './BrakeByWire';
 import { HydraulicBrake } from './HydraulicBrake';
 import { BrakeSystem } from './BrakeBase';
-import { BARRIER, BODY_CORNERS, K_EFF, K_UNLOAD, RESTITUTION, Impact } from './Barrier';
+import { BARRIER, BODY_CORNERS, K_EFF, K_UNLOAD, RESTITUTION, WHEEL_DAMAGE, Impact } from './Barrier';
 
 const clamp = (x: number, a: number, b: number) => Math.min(b, Math.max(a, x));
 
@@ -25,6 +25,10 @@ export interface VehiclePose {
   s: number; d: number; yaw: number; q: number; phi: number; theta: number;
   steer: number; spin: number[]; hubs: number[];
 }
+
+/** damage to one wheel / corner: alignment, bent-rim runout, rubbing drag, or the whole wheel gone */
+export interface WheelDamage { toe: number; camber: number; runout: number; drag: number; detached: boolean }
+const SKID_MU = 0.55; // steel upright / disc sliding on asphalt
 
 export interface VehicleInputs { throttle: number; brake: number; steer?: number; }
 export interface VehicleOptions { emb: boolean; active: boolean; }
@@ -84,6 +88,10 @@ export class Vehicle {
   /** barrier impacts since the consumer last drained this queue (visual damage, debris, HUD) */
   impacts: Impact[] = [];
   private contact = BODY_CORNERS.map(() => ({ on: false, vn0: 0, peak: 0, emitted: false }));
+  /** per-wheel damage (FL, FR, RL, RR); toe + = points left, camber + = top tilted inwards */
+  wheelDmg: WheelDamage[] = [0, 1, 2, 3].map(() => ({ toe: 0, camber: 0, runout: 0, drag: 0, detached: false }));
+  private damaged = false;
+  private dmgYaw = 0; // yaw torque from asymmetric longitudinal forces of damaged / missing wheels
   time = 0;
   distance = 0;
 
@@ -141,6 +149,8 @@ export class Vehicle {
     this.yaw = 0; this.yawRate = 0;
     this.crashed = false; this.offRoad = false;
     this.damageJ = 0; this.impacts = [];
+    for (const w of this.wheelDmg) { w.toe = 0; w.camber = 0; w.runout = 0; w.drag = 0; w.detached = false; }
+    this.damaged = false; this.dmgYaw = 0;
     for (const c of this.contact) { c.on = false; c.vn0 = 0; c.peak = 0; c.emitted = false; }
     this.susp.reset();
     this.active.reset();
@@ -225,27 +235,113 @@ export class Vehicle {
     const limits = [0, 1].map(axle => {
       let available = 0;
       for (let i = axle * 2; i < axle * 2 + 2; i++) {
-        const grip = CAR.tireMu * this.susp.ft[i] * (this.offRoad ? 0.45 : 1);
+        if (this.wheelDmg[i].detached) continue;
+        const grip = CAR.tireMu * this.susp.ft[i] * this.gripFactor(i) * (this.offRoad ? 0.45 : 1);
         available += Math.sqrt(Math.max(0, grip * grip - Math.min(grip, Math.abs(this.fx[i])) ** 2));
       }
       return available;
     });
     // Slip angles in the wheel frame against |vx|: identical to delta - atan2(vy, vx) when driving
     // forward, and still opposing the contact-patch slide when the car travels backwards after a spin.
-    const cd = Math.cos(this.steerAngle), sd = Math.sin(this.steerAngle);
+    // Damaged wheels: front toe adds to the steering (the car pulls), a bent rim's runout wobbles it
+    // once per wheel revolution (shimmy), rear toe steers the rear axle.
+    const wd = this.wheelDmg;
+    const frontToe = this.damaged ? (wd[0].toe + wd[1].toe) / 2 + (wd[0].runout * Math.sin(this.spin[0]) + wd[1].runout * Math.sin(this.spin[1])) * 0.15 : 0;
+    const rearToe = this.damaged ? (wd[2].toe + wd[3].toe) / 2 : 0;
+    const delta = this.steerAngle + frontToe;
+    const cd = Math.cos(delta), sd = Math.sin(delta);
     const vyF = this.lateralSpeed + a * this.yawRate;
     const af = -Math.atan2(vyF * cd - v * sd, Math.abs(v * cd + vyF * sd));
-    const ar = -Math.atan2(this.lateralSpeed - b * this.yawRate, Math.abs(v));
+    const ar = rearToe - Math.atan2(this.lateralSpeed - b * this.yawRate, Math.abs(v));
     const fyF = limits[0] * Math.tanh(CAR.corneringFront * af / Math.max(1, limits[0]));
     const fyR = limits[1] * Math.tanh(CAR.corneringRear * ar / Math.max(1, limits[1]));
     this.lateralForce = [fyF, fyR];
-    this.ayFelt = (fyF + fyR) / CAR.mass;
+    // skidding corners without a wheel: sliding friction sideways, plus the yaw moment of their drag
+    let fySkid = 0, mzSkid = this.damaged ? this.dmgYaw : 0;
+    for (let i = 0; i < 4; i++) {
+      if (!wd[i].detached) continue;
+      const uc = v - this.yawRate * CORNER_Y[i], wc = this.lateralSpeed + this.yawRate * CORNER_X[i];
+      const vc = Math.hypot(uc, wc);
+      const fy = vc > 0.05 ? -SKID_MU * this.susp.ft[i] * wc / vc : 0;
+      fySkid += fy; mzSkid += CORNER_X[i] * fy;
+    }
+    this.ayFelt = (fyF + fyR + fySkid) / CAR.mass;
     // Body-frame rigid-body equations: the rotating-frame terms come in a pair (+vy*r on vx, -vx*r on vy),
     // so yaw only exchanges speed between the axes and never creates kinetic energy in a spin.
     const coriolisX = this.lateralSpeed * this.yawRate;
     this.lateralSpeed += h * (this.ayFelt + G * Math.sin(road.bankAt(this.s)) - v * this.yawRate);
     this.v += h * coriolisX;
-    this.yawRate += h * (a * fyF - b * fyR) / CAR.yawInertia;
+    this.yawRate += h * (a * fyF - b * fyR + mzSkid) / CAR.yawInertia;
+  }
+
+  /** lateral / longitudinal grip left on a wheel: camber tilts the contact patch off the road */
+  private gripFactor(i: number) {
+    const w = this.wheelDmg[i];
+    return w.detached ? 0 : 1 - Math.min(0.45, 1.6 * Math.abs(w.camber));
+  }
+
+  get undrivable() {
+    return this.wheelDmg.some((w) => w.detached || Math.abs(w.toe) > WHEEL_DAMAGE.maxToe || w.camber > WHEEL_DAMAGE.maxCamber);
+  }
+
+  /**
+   * Distribute an impact to the wheels near the contact point (x forward, y left, push direction
+   * (dx, dy) into the car). Local energy bends a wheel: the push's moment about the wheel centre sets
+   * the toe direction; enough energy tears the wheel off (crash structures are designed for it, so
+   * it does not get driven into the footwell). Returns the wheels that came off.
+   */
+  damageWheels(x: number, y: number, dx: number, dy: number, energyJ: number): number[] {
+    const off: number[] = [];
+    for (let i = 0; i < 4; i++) {
+      const w = this.wheelDmg[i];
+      if (w.detached) continue;
+      const dist = Math.hypot(CORNER_X[i] - x, CORNER_Y[i] - y);
+      const local = energyJ * Math.max(0, 1 - dist / WHEEL_DAMAGE.reach);
+      if (local < 1500) continue;
+      if (local > WHEEL_DAMAGE.detachJ) { w.detached = true; off.push(i); continue; }
+      const bend = local / WHEEL_DAMAGE.bendJ;
+      const moment = (x - CORNER_X[i]) * dy - (y - CORNER_Y[i]) * dx; // r x F about the wheel centre
+      const sign = Math.abs(moment) > 0.05 ? Math.sign(moment) : (i % 2 === 0 ? -1 : 1);
+      w.toe = clamp(w.toe + sign * bend * 0.8, -0.35, 0.35);
+      w.camber = Math.min(0.35, w.camber + bend);
+      w.runout = Math.min(0.15, w.runout + bend * 0.4);
+      w.drag = Math.min(0.3, w.drag + bend);
+    }
+    this.damaged = this.wheelDmg.some((w) => w.detached || w.toe !== 0 || w.camber !== 0);
+    if (!this.crashed && this.undrivable) { this.crashed = true; this.event = 'crash'; }
+    return off;
+  }
+
+  /** record an impact from any source (barrier, another car): damage bookkeeping + wheels */
+  registerImpact(im: Omit<Impact, 'wrecked' | 'detached'>): Impact {
+    const before = this.crashed;
+    this.damageJ += im.energyJ;
+    if (!this.crashed && this.damageJ > BARRIER.wreckJ) { this.crashed = true; this.event = 'crash'; }
+    const detached = this.damageWheels(im.x, im.yL, im.nx, im.nyL, im.energyJ);
+    const full: Impact = { ...im, detached, wrecked: !before && this.crashed };
+    this.impacts.push(full);
+    if (this.impacts.length > 32) this.impacts.shift();
+    return full;
+  }
+
+  /** an impulse [N s] in the road frame (s, d) at a point r (road frame, from the CG) */
+  applyImpulse(jS: number, jD: number, rS: number, rD: number) {
+    const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw);
+    this.v += (jS * cy + jD * sy) / CAR.mass;
+    this.lateralSpeed += (-jS * sy + jD * cy) / CAR.mass;
+    this.yawRate += (rS * jD - rD * jS) / CAR.yawInertia;
+  }
+
+  /** positional correction after a contact (road frame) */
+  shift(dS: number, dD: number) {
+    this.s = road.wrap(this.s + dS);
+    this.lane.d += dD;
+  }
+
+  /** road-frame velocity of the CG */
+  roadVelocity(): [number, number] {
+    const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw);
+    return [this.v * cy - this.lateralSpeed * sy, this.v * sy + this.lateralSpeed * cy];
   }
 
   /**
@@ -283,16 +379,12 @@ export class Vehicle {
       if (!c.emitted && penRate <= 0.05 && c.vn0 > 0.3) {
         c.emitted = true;
         const energyJ = 0.5 * mEff * c.vn0 * c.vn0 * (1 - RESTITUTION * RESTITUTION);
-        this.damageJ += energyJ;
-        const wreckNow = !this.crashed && this.damageJ > BARRIER.wreckJ;
-        if (wreckNow) { this.crashed = true; this.event = 'crash'; }
         const share = BARRIER.kRail / (BARRIER.kRail + BARRIER.kBody);
-        this.impacts.push({
+        this.registerImpact({
           corner: i, x, yL: y, nx: -side * sy, nyL: -side * cy, normalSpeed: c.vn0, energyJ,
           penetration: c.peak, bodyCrush: c.peak * BARRIER.plastic * share, railBend: c.peak * BARRIER.plastic * (1 - share),
-          s: road.wrap(this.s + rS), side, slideSpeed: vcS, vS, vD, wrecked: wreckNow,
+          s: road.wrap(this.s + rS), side, slideSpeed: vcS, vS, vD, kind: 'barrier', nS: 0, nD: -side,
         });
-        if (this.impacts.length > 32) this.impacts.shift();
       }
     }
     if (fS === 0 && fD === 0) return;
@@ -401,6 +493,7 @@ export class Vehicle {
     const TD = (this.driveForce * CAR.wheelRadius) / 4;
 
     // --- sub-stepped wheel / suspension integration ------------------------------
+    for (let i = 0; i < 4; i++) this.susp.detached[i] = this.wheelDmg[i].detached;
     const N = 2;
     const h = dt / N;
     for (let sub = 0; sub < N; sub++) {
@@ -417,8 +510,20 @@ export class Vehicle {
       // tyres + wheels
       const vref = Math.max(Math.abs(this.v), 2.5);
       let sumFx = 0;
+      this.dmgYaw = 0;
       for (let i = 0; i < 4; i++) {
-        const fz = this.susp.ft[i];
+        const wd = this.wheelDmg[i];
+        if (wd.detached) {
+          // no wheel: the upright skids; Coulomb friction opposes the corner's sliding velocity
+          const uc = this.v - this.yawRate * CORNER_Y[i], wc = this.lateralSpeed + this.yawRate * CORNER_X[i];
+          const vc = Math.hypot(uc, wc);
+          const fxs = vc > 0.05 ? SKID_MU * this.susp.ft[i] * uc / vc : 0;
+          this.fx[i] = fxs; this.slip[i] = 0; this.omega[i] = 0;
+          sumFx += fxs;
+          this.dmgYaw += CORNER_Y[i] * fxs;
+          continue;
+        }
+        const fz = this.susp.ft[i] * this.gripFactor(i);
         const kappa = clamp((this.v - this.omega[i] * CAR.wheelRadius) / vref, -1, 1);
         this.slip[i] = kappa;
         const axle = i < 2 ? 0 : 1;
@@ -433,10 +538,12 @@ export class Vehicle {
         const gp = (CAR.wheelRadius / CAR.wheelInertia) * dFdw;
         // Brake torque is friction: it slows the wheel towards zero in either direction but never reverses it.
         const free = this.omega[i] + (h * g0) / (1 - h * gp);
-        const dwBrake = (h * brake.torque[i] / CAR.wheelInertia) / (1 - h * gp);
+        // a bent wheel rubs on its arch / broken suspension: extra friction torque on that wheel only
+        const dwBrake = (h * (brake.torque[i] + 8000 * wd.drag) / CAR.wheelInertia) / (1 - h * gp);
         const wn = Math.abs(free) <= dwBrake ? 0 : free - Math.sign(free) * dwBrake;
         this.omega[i] = wn;
         sumFx += fxi;
+        if (this.damaged) this.dmgYaw += CORNER_Y[i] * fxi; // left/right force difference yaws the car
         // disc heat
         const pw = brake.torque[i] * Math.abs(this.omega[i]);
         const cool = 12 + 0.9 * Math.abs(this.v);

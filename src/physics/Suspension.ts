@@ -21,6 +21,10 @@ export const SPRUNG_CORNER = [
 /** static tyre deflection per corner: wheel centre sits R - deflection above the road so the contact patch is exactly on it */
 export const STATIC_DEFLECT = SPRUNG_CORNER.map((m) => ((m + CAR.unsprungMass) * G) / SUSP.kTire);
 
+/** how far a corner drops without its wheel before the upright touches the road [m], and that contact */
+export const SKID_DROP = 0.14;
+const SKID_K = 250000, SKID_C = 8000;
+
 export interface SuspInput {
   r: number[]; // road height relative to the reference plane, per corner
   rd: number[]; // rate of r
@@ -46,10 +50,13 @@ export class SuspensionModel {
   comp = [0, 0, 0, 0]; // compression x_i [m]
   compRate = [0, 0, 0, 0];
   airborne = false;
+  /** corner has lost its wheel: no spring / tyre, the upright and body corner skid on the road */
+  detached = [false, false, false, false];
 
   reset() {
     this.q = this.qd = this.phi = this.phid = this.theta = this.thetad = 0;
     this.u.fill(0); this.ud.fill(0); this.fAct.fill(0);
+    this.detached.fill(false);
     this.ft = SPRUNG_CORNER.map((m) => (m + CAR.unsprungMass) * G);
   }
 
@@ -64,6 +71,19 @@ export class SuspensionModel {
       const x = CORNER_X[i], y = CORNER_Y[i];
       const a = this.q + this.phi * y - this.theta * x;
       const ad = this.qd + this.phid * y - this.thetad * x;
+      if (this.detached[i]) {
+        // No wheel: the corner is unsupported until the upright / brake disc reaches the road
+        // (~SKID_DROP below its normal ride height); then a stiff ground contact carries it.
+        const pen = inp.r[i] - a - SKID_DROP, penD = inp.rd[i] - ad;
+        let fsk = pen > 0 ? SKID_K * pen + SKID_C * penD : 0;
+        if (fsk < 0) fsk = 0; else if (pen > 0) anyContact = true;
+        this.ft[i] = fsk;
+        this.u[i] = a; this.ud[i] = ad;
+        this.comp[i] = 0; this.compRate[i] = 0; this.fSpring[i] = 0; this.fDamper[i] = 0; this.fAct[i] = 0;
+        const fb = fsk - (i < 2 ? inp.dfFront / 2 : inp.dfRear / 2);
+        sumF += fb; sumFy += fb * y; sumFx += fb * x;
+        continue;
+      }
       const xc = this.u[i] - a;
       const xcd = this.ud[i] - ad;
       this.comp[i] = xc;
