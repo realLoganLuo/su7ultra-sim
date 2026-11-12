@@ -87,6 +87,7 @@ export class Game {
   fps = 0;
   private overspeedLevel: 0 | 1 | 2 = 0;
   private advised = 0;
+  private firstCornerHinted = false;
   private autoRotate = true;
   paused = false; // debug / automation: render without advancing the simulation
   glbTpl: GlbTemplate | null = null;
@@ -490,6 +491,12 @@ export class Game {
     this.advised = vs * 3.6;
     const vsHere = safeSpeed(p.s, p.d);
     this.overspeedLevel = p.v > vsHere * 0.98 ? 2 : p.v > vs * 0.97 && p.v > 20 ? 1 : 0;
+
+    // One gentle hint per page load: holding only W from the grid runs wide at the first bend (~6 s).
+    if (!this.firstCornerHinted && this.lap.laps === 0 && p.s > 30 && p.s < 100 && p.v > 20) {
+      this.firstCornerHinted = true;
+      this.hud.toast('前方连续弯道 · 用 A / D 转向跟随赛道，入弯前松开 W、按 S 减速', 'warn', 4500);
+    }
 
     // graph sampling at 60 Hz
     if (++this.simTick % 2 === 0) this.hud.sampleGraphs(this.panelCtx());
