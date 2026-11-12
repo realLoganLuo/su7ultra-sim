@@ -31,6 +31,23 @@ for (const kmh of [100,200,300]) {
 }
 console.log({brakeResults, mass:CAR.mass});
 
+// EMB concept: its slip controller must hold the target slip on every wheel (the lightly
+// loaded rear axle used to limit-cycle between 3 % and 20 % slip) and stop within its
+// latency budget of the hydraulic ABS, never far behind it.
+const embStop = (() => {
+  const v = new Vehicle({emb: true, active: false}); v.reset(100, 0, 200 / 3.6);
+  let t = 0, rearMin = Infinity, rearMax = -Infinity;
+  while (t < 15 && v.v > 0.05) {
+    v.step(dt, {throttle:0, brake:1}); t += dt;
+    if (t > 1 && v.v > 10) for (const i of [2, 3]) { rearMin = Math.min(rearMin, v.slip[i]); rearMax = Math.max(rearMax, v.slip[i]); }
+  }
+  return {metres: v.distance, seconds: t, rearMin, rearMax};
+})();
+const hydStop = (() => { const v = vehicle(200); while (v.v > 0.05) v.step(dt, {throttle:0, brake:1}); return v.distance; })();
+assert(embStop.rearMin > 0.07 && embStop.rearMax < 0.15, `EMB rear slip must stay near target: ${embStop.rearMin.toFixed(3)}..${embStop.rearMax.toFixed(3)}`);
+assert(embStop.metres < hydStop * 1.05, `EMB 200-0 (${embStop.metres.toFixed(1)} m) must be within 5 % of hydraulic (${hydStop.toFixed(1)} m)`);
+console.log({embStop200:{metres:+embStop.metres.toFixed(1),seconds:+embStop.seconds.toFixed(2),rearSlip:[+embStop.rearMin.toFixed(3),+embStop.rearMax.toFixed(3)]},hydStop200:+hydStop.toFixed(1)});
+
 // Left/right symmetry, short taps, reversal and release: use actual steering input.
 for (const speed of [5, 20, 100, 200, 300, 350]) {
   const left = vehicle(speed), right = vehicle(speed);
