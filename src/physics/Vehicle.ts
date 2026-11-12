@@ -7,6 +7,7 @@ import { ActiveSuspension } from './ActiveSuspension';
 import { BrakeByWire } from './BrakeByWire';
 import { HydraulicBrake } from './HydraulicBrake';
 import { BrakeSystem } from './BrakeBase';
+import { BARRIER, BODY_CORNERS, K_EFF, K_UNLOAD, RESTITUTION, Impact } from './Barrier';
 
 const clamp = (x: number, a: number, b: number) => Math.min(b, Math.max(a, x));
 
@@ -75,8 +76,14 @@ export class Vehicle {
   yaw = 0;
   yawRate = 0;
   steerAngle = 0;
+  /** wrecked: accumulated barrier damage exceeded BARRIER.wreckJ; drive is lost */
   crashed = false;
   offRoad = false;
+  /** absorbed barrier impact energy since the last reset [J] */
+  damageJ = 0;
+  /** barrier impacts since the consumer last drained this queue (visual damage, debris, HUD) */
+  impacts: Impact[] = [];
+  private contact = BODY_CORNERS.map(() => ({ on: false, vn0: 0, peak: 0, emitted: false }));
   time = 0;
   distance = 0;
 
@@ -133,6 +140,8 @@ export class Vehicle {
     this.steerAngle = 0; this.spin.fill(0);
     this.yaw = 0; this.yawRate = 0;
     this.crashed = false; this.offRoad = false;
+    this.damageJ = 0; this.impacts = [];
+    for (const c of this.contact) { c.on = false; c.vn0 = 0; c.peak = 0; c.emitted = false; }
     this.susp.reset();
     this.active.reset();
     this.emb.reset(); this.hyd.reset();
@@ -195,7 +204,7 @@ export class Vehicle {
       target = Math.atan(CAR.wheelbase * (road.curvature(this.s) + ay / Math.max(25, this.v * this.v)))
         + 0.02 * ay / G - 0.4 * this.yaw;
     }
-    const rate = 0.8 / (1 + this.v / 30);
+    const rate = 0.8 / (1 + Math.abs(this.v) / 30);
     const delta = (target - this.steerAngle) * (1 - Math.exp(-dt / 0.09));
     this.steerAngle += clamp(delta, -rate * dt, rate * dt);
   }
@@ -203,12 +212,12 @@ export class Vehicle {
   /** Two-axle bicycle dynamics; axle slip forces share grip with longitudinal tyres. */
   private lateralStep(h: number) {
     const v = this.v, a = CAR.xFront, b = -CAR.xRear;
-    if (v < 6) {
+    if (Math.abs(v) < 6) {
       const r = v * Math.tan(this.steerAngle) / CAR.wheelbase;
       const k = 1 - Math.exp(-h * 12);
       this.yawRate += (r - this.yawRate) * k;
       this.lateralSpeed += (b * r - this.lateralSpeed) * k;
-      if (v < 0.05) { this.yawRate = 0; this.lateralSpeed = 0; }
+      if (Math.abs(v) < 0.05) { this.yawRate = 0; this.lateralSpeed = 0; }
       this.ayFelt = v * this.yawRate;
       this.lateralForce = [this.ayFelt * CAR.mass * b / CAR.wheelbase, this.ayFelt * CAR.mass * a / CAR.wheelbase];
       return;
@@ -221,14 +230,75 @@ export class Vehicle {
       }
       return available;
     });
-    const af = this.steerAngle - Math.atan2(this.lateralSpeed + a * this.yawRate, v);
-    const ar = -Math.atan2(this.lateralSpeed - b * this.yawRate, v);
+    // Slip angles in the wheel frame against |vx|: identical to delta - atan2(vy, vx) when driving
+    // forward, and still opposing the contact-patch slide when the car travels backwards after a spin.
+    const cd = Math.cos(this.steerAngle), sd = Math.sin(this.steerAngle);
+    const vyF = this.lateralSpeed + a * this.yawRate;
+    const af = -Math.atan2(vyF * cd - v * sd, Math.abs(v * cd + vyF * sd));
+    const ar = -Math.atan2(this.lateralSpeed - b * this.yawRate, Math.abs(v));
     const fyF = limits[0] * Math.tanh(CAR.corneringFront * af / Math.max(1, limits[0]));
     const fyR = limits[1] * Math.tanh(CAR.corneringRear * ar / Math.max(1, limits[1]));
     this.lateralForce = [fyF, fyR];
     this.ayFelt = (fyF + fyR) / CAR.mass;
+    // Body-frame rigid-body equations: the rotating-frame terms come in a pair (+vy*r on vx, -vx*r on vy),
+    // so yaw only exchanges speed between the axes and never creates kinetic energy in a spin.
+    const coriolisX = this.lateralSpeed * this.yawRate;
     this.lateralSpeed += h * (this.ayFelt + G * Math.sin(road.bankAt(this.s)) - v * this.yawRate);
+    this.v += h * coriolisX;
     this.yawRate += h * (a * fyF - b * fyR) / CAR.yawInertia;
+  }
+
+  /**
+   * Rigid-body contact of the four body corners with the Armco (see Barrier.ts). Forces act at the
+   * corners, so a hit decelerates, rebounds and spins the car; nothing is clamped or zeroed.
+   */
+  private barrierContact(dt: number, dsdt: number) {
+    const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw);
+    const vS = this.v * cy - this.lateralSpeed * sy; // CG velocity in the road frame
+    const vD = this.v * sy + this.lateralSpeed * cy;
+    const w = this.yawRate - road.curvature(this.s) * dsdt; // body rotation relative to the rail
+    let fS = 0, fD = 0, tau = 0;
+    for (let i = 0; i < 4; i++) {
+      const [x, y] = BODY_CORNERS[i];
+      const rS = x * cy - y * sy, rD = x * sy + y * cy;
+      const dc = this.d + rD;
+      const side = dc >= 0 ? 1 : -1;
+      const pen = Math.abs(dc) - TRACK_CFG.armcoD;
+      const c = this.contact[i];
+      if (pen <= 0) { c.on = false; continue; }
+      const vcS = vS - w * rD, vcD = vD + w * rS; // corner velocity
+      const penRate = side * vcD;
+      const mEff = 1 / (1 / CAR.mass + (rS * rS) / CAR.yawInertia); // effective mass along the rail normal
+      if (!c.on) { c.on = true; c.vn0 = Math.max(0, penRate); c.peak = 0; c.emitted = false; }
+      c.peak = Math.max(c.peak, pen);
+      // elastic-plastic: load along K_EFF, unload along K_UNLOAD towards the permanent set
+      const elastic = pen >= c.peak ? K_EFF * pen : Math.max(0, K_UNLOAD * (pen - BARRIER.plastic * c.peak));
+      const damp = 2 * BARRIER.zeta * Math.sqrt(K_EFF * mEff);
+      const fn = Math.max(0, elastic + (elastic > 0 ? damp * penRate : 0) + (pen > BARRIER.maxPen ? BARRIER.kStop * (pen - BARRIER.maxPen) : 0));
+      const ft = -BARRIER.mu * fn * Math.tanh(vcS / 0.3);
+      const fdi = -side * fn;
+      fS += ft; fD += fdi;
+      tau += rS * fdi - rD * ft;
+      // report the impact once, at peak penetration
+      if (!c.emitted && penRate <= 0.05 && c.vn0 > 0.3) {
+        c.emitted = true;
+        const energyJ = 0.5 * mEff * c.vn0 * c.vn0 * (1 - RESTITUTION * RESTITUTION);
+        this.damageJ += energyJ;
+        const wreckNow = !this.crashed && this.damageJ > BARRIER.wreckJ;
+        if (wreckNow) { this.crashed = true; this.event = 'crash'; }
+        const share = BARRIER.kRail / (BARRIER.kRail + BARRIER.kBody);
+        this.impacts.push({
+          corner: i, x, yL: y, nx: -side * sy, nyL: -side * cy, normalSpeed: c.vn0, energyJ,
+          penetration: c.peak, bodyCrush: c.peak * BARRIER.plastic * share, railBend: c.peak * BARRIER.plastic * (1 - share),
+          s: road.wrap(this.s + rS), side, slideSpeed: vcS, vS, vD, wrecked: wreckNow,
+        });
+        if (this.impacts.length > 32) this.impacts.shift();
+      }
+    }
+    if (fS === 0 && fD === 0) return;
+    this.v += ((fS * cy + fD * sy) / CAR.mass) * dt;
+    this.lateralSpeed += ((-fS * sy + fD * cy) / CAR.mass) * dt;
+    this.yawRate += (tau / CAR.yawInertia) * dt;
   }
 
   private contactHeights(s: number, d: number, out?: { r: number[]; h0: number; slope: number }) {
@@ -273,7 +343,10 @@ export class Vehicle {
     this.previousPose = this.pose();
     this.time += dt;
     const brake = this.brake;
-    const v = Math.max(this.v, 0);
+    const v = Math.abs(this.v); // speed magnitude (the car may slide backwards after a spin)
+    const dir = this.v < 0 ? -1 : 1;
+    // A wrecked car has no drive and drags to a stop on damaged wheels.
+    if (this.crashed && !settling) inp = { ...inp, throttle: 0, brake: Math.max(inp.brake, 0.5) };
 
     if (!settling) this.steer(dt, inp.steer);
     const dTot = this.d;
@@ -342,7 +415,7 @@ export class Vehicle {
         omega: this.omega, slip: this.slip, fz: this.susp.ft, tv: tvDemand,
       });
       // tyres + wheels
-      const vref = Math.max(this.v, 2.5);
+      const vref = Math.max(Math.abs(this.v), 2.5);
       let sumFx = 0;
       for (let i = 0; i < 4; i++) {
         const fz = this.susp.ft[i];
@@ -356,26 +429,33 @@ export class Vehicle {
         const fxi = mf * tyreF(kappa);
         this.fx[i] = fxi;
         const dFdw = -mf * Math.max(0, tyreDF(kappa)) * CAR.wheelRadius / vref; // stabilising part of dFx/domega (<=0)
-        const g0 = (fxi * CAR.wheelRadius + TD - brake.torque[i]) / CAR.wheelInertia;
+        const g0 = (fxi * CAR.wheelRadius + TD) / CAR.wheelInertia;
         const gp = (CAR.wheelRadius / CAR.wheelInertia) * dFdw;
-        let wn = this.omega[i] + (h * g0) / (1 - h * gp);
-        if (wn < 0) wn = 0;
+        // Brake torque is friction: it slows the wheel towards zero in either direction but never reverses it.
+        const free = this.omega[i] + (h * g0) / (1 - h * gp);
+        const dwBrake = (h * brake.torque[i] / CAR.wheelInertia) / (1 - h * gp);
+        const wn = Math.abs(free) <= dwBrake ? 0 : free - Math.sign(free) * dwBrake;
         this.omega[i] = wn;
         sumFx += fxi;
         // disc heat
-        const pw = brake.torque[i] * this.omega[i];
-        const cool = 12 + 0.9 * this.v;
+        const pw = brake.torque[i] * Math.abs(this.omega[i]);
+        const cool = 12 + 0.9 * Math.abs(this.v);
         this.discTemp[i] += (h * (pw / 3500)) - h * ((this.discTemp[i] - 25) * cool) / 3500;
         this.spin[i] += this.omega[i] * h;
       }
       const rolling = this.susp.airborne ? 0 : CAR.rolling * CAR.mass * G;
       const offRoadDrag = this.offRoad ? 3.5 * CAR.mass : 0;
-      const aT = (-sumFx - drag - (this.v > 0.05 ? rolling : 0) - (this.v > 0.05 ? offRoadDrag : 0)) / CAR.mass;
+      const moving = Math.abs(this.v) > 0.05;
+      const aT = (-sumFx - dir * (drag + (moving ? rolling + offRoadDrag : 0))) / CAR.mass;
       this.axFelt = aT;
       this.v += h * (aT - G * ft.sinS);
-      if (this.v < 0) this.v = 0;
+      // Auto hold (as on the real EV): a car creeping backwards at walking pace with no throttle and
+      // nothing pushing it is held, instead of rolling back down a gradient.
+      if (this.v < 0 && this.v > -0.5 && inp.throttle < 0.02 && Math.abs(this.lateralSpeed) < 0.5 && !this.contact.some((c) => c.on)) {
+        this.v = 0; for (let i = 0; i < 4; i++) this.omega[i] = Math.max(0, this.omega[i]);
+      }
       // Static friction: stop without a low-speed slip limit cycle; hold on a gradient.
-      if (this.v < 0.12 && inp.brake > 0.05 && brake.torque.reduce((a,b) => a+b,0) / CAR.wheelRadius > CAR.mass * G * Math.abs(ft.sinS)) {
+      if (Math.abs(this.v) < 0.12 && inp.brake > 0.05 && brake.torque.reduce((a,b) => a+b,0) / CAR.wheelRadius > CAR.mass * G * Math.abs(ft.sinS)) {
         this.v = 0; this.omega.fill(0); this.slip.fill(0);
       }
       if (settling) { this.v = 0; this.omega.fill(0); }
@@ -383,33 +463,27 @@ export class Vehicle {
     }
     this.rPrev = r;
 
-    // Integrate the actual heading and lateral velocity in track coordinates.
+    // Integrate the actual heading and lateral velocity in track coordinates. Near the Armco the pose and
+    // the stiff barrier contact are integrated together in sub-steps (stable for the elastic-plastic rail).
     if (!settling) {
-      const forward = this.v * Math.cos(this.yaw) - this.lateralSpeed * Math.sin(this.yaw);
-      const lateral = this.v * Math.sin(this.yaw) + this.lateralSpeed * Math.cos(this.yaw);
-      const dsdt = forward / Math.max(0.25, 1 - road.curvature(this.s) * this.d);
-      this.yaw += (this.yawRate - road.curvature(this.s) * dsdt) * dt;
-      this.yaw = Math.atan2(Math.sin(this.yaw), Math.cos(this.yaw));
-      this.lane.ddd = (lateral - this.lane.dd) / dt;
-      this.lane.dd = lateral;
-      this.lane.d += lateral * dt;
-      this.s = road.wrap(this.s + dsdt * dt);
-      this.distance += Math.hypot(this.v, this.lateralSpeed) * dt;
+      const reach = Math.hypot(2.65, 1.03) + Math.hypot(this.v, this.lateralSpeed) * dt;
+      const n = Math.abs(this.d) + reach > TRACK_CFG.armcoD ? 10 : 1;
+      const h = dt / n;
+      const dd0 = this.lane.dd;
+      for (let k = 0; k < n; k++) {
+        const forward = this.v * Math.cos(this.yaw) - this.lateralSpeed * Math.sin(this.yaw);
+        const lateral = this.v * Math.sin(this.yaw) + this.lateralSpeed * Math.cos(this.yaw);
+        const dsdt = forward / Math.max(0.25, 1 - road.curvature(this.s) * this.d);
+        this.yaw += (this.yawRate - road.curvature(this.s) * dsdt) * h;
+        this.yaw = Math.atan2(Math.sin(this.yaw), Math.cos(this.yaw));
+        this.lane.dd = lateral;
+        this.lane.d += lateral * h;
+        this.s = road.wrap(this.s + dsdt * h);
+        this.distance += Math.hypot(this.v, this.lateralSpeed) * h;
+        if (n > 1) this.barrierContact(h, dsdt);
+      }
+      this.lane.ddd = (this.lane.dd - dd0) / dt;
       this.offRoad = Math.abs(this.d) > TRACK_CFG.curbOuter;
-      // The body is a rectangle: yawed, its corners reach the Armco before its centre reaches crashD.
-      // Use the lateral half-extent of the rotated body so a sliding car never passes through the rail
-      // (identical to crashD when straight).
-      const halfEdge = TRACK_CFG.armcoD - TRACK_CFG.crashD;
-      const extent = (CAR.length / 2) * Math.abs(Math.sin(this.yaw)) + halfEdge * Math.abs(Math.cos(this.yaw));
-      const limit = Math.max(0, TRACK_CFG.armcoD - extent);
-      if (Math.abs(this.d) > limit && !this.crashed) {
-        this.crashed = true; this.v *= 0.3; this.event = 'crash';
-      }
-      if (this.crashed) {
-        this.lane.d = clamp(this.d, -limit, limit);
-        this.lateralSpeed = 0; this.yawRate = 0;
-        this.v = Math.max(0, this.v - 12 * dt);
-      }
     }
 
     // brake lights
