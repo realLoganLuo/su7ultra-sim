@@ -241,7 +241,10 @@ export class Vehicle {
       const cy = Math.cos(this.yaw), sy = Math.sin(this.yaw);
       const si = s + CORNER_X[i] * cy - CORNER_Y[i] * sy;
       const di = d + CORNER_X[i] * sy + CORNER_Y[i] * cy;
-      const h = road.height(si, di);
+      // A sliding car's centre may still be inside the crash limit while a yawed corner already reaches
+      // past the Armco, where the terrain falls away. The barrier is in the way, so never sample the
+      // ground behind it: otherwise that wheel hangs at full droop and visibly floats in the air.
+      const h = road.height(si, clamp(di, -TRACK_CFG.armcoD, TRACK_CFG.armcoD));
       r[i] = h - (h0 + slope * (si - s) - sb * (di - d));
     }
     if (out) { out.r = r; out.h0 = h0; out.slope = slope; }
@@ -393,11 +396,17 @@ export class Vehicle {
       this.s = road.wrap(this.s + dsdt * dt);
       this.distance += Math.hypot(this.v, this.lateralSpeed) * dt;
       this.offRoad = Math.abs(this.d) > TRACK_CFG.curbOuter;
-      if (Math.abs(this.d) > TRACK_CFG.crashD && !this.crashed) {
+      // The body is a rectangle: yawed, its corners reach the Armco before its centre reaches crashD.
+      // Use the lateral half-extent of the rotated body so a sliding car never passes through the rail
+      // (identical to crashD when straight).
+      const halfEdge = TRACK_CFG.armcoD - TRACK_CFG.crashD;
+      const extent = (CAR.length / 2) * Math.abs(Math.sin(this.yaw)) + halfEdge * Math.abs(Math.cos(this.yaw));
+      const limit = Math.max(0, TRACK_CFG.armcoD - extent);
+      if (Math.abs(this.d) > limit && !this.crashed) {
         this.crashed = true; this.v *= 0.3; this.event = 'crash';
       }
       if (this.crashed) {
-        this.lane.d = clamp(this.d, -TRACK_CFG.crashD, TRACK_CFG.crashD);
+        this.lane.d = clamp(this.d, -limit, limit);
         this.lateralSpeed = 0; this.yawRate = 0;
         this.v = Math.max(0, this.v - 12 * dt);
       }

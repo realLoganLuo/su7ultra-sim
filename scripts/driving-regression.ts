@@ -48,6 +48,27 @@ assert(embStop.rearMin > 0.07 && embStop.rearMax < 0.15, `EMB rear slip must sta
 assert(embStop.metres < hydStop * 1.05, `EMB 200-0 (${embStop.metres.toFixed(1)} m) must be within 5 % of hydraulic (${hydStop.toFixed(1)} m)`);
 console.log({embStop200:{metres:+embStop.metres.toFixed(1),seconds:+embStop.seconds.toFixed(2),rearSlip:[+embStop.rearMin.toFixed(3),+embStop.rearMax.toFixed(3)]},hydStop200:+hydStop.toFixed(1)});
 
+// A car sliding sideways along the barrier has yawed corners past the Armco line, where the
+// terrain drops away. Those wheels must not hang over the drop (they used to float ~20 cm).
+{
+  const flatHeight = road.height;
+  road.height = (s, d) => (Math.abs(d) > 9.05 ? -0.6 : 0);
+  const v = vehicle(150); v.lane.d = 7.7; v.yaw = 1.05; // ~60 deg slide, centre still inside the crash limit
+  let maxGap = 0, maxCornerD = 0;
+  for (let i = 0; i < 24; i++) {
+    v.step(dt, {throttle:0, brake:0, steer:0});
+    // hub height above the ground under that wheel; about -2 cm (tyre deflection) when in contact
+    const ground = (v as unknown as { rPrev: number[] }).rPrev;
+    maxGap = Math.max(maxGap, ...v.susp.u.map((u, k) => u - ground[k]));
+    const cy = Math.cos(v.yaw), sy = Math.sin(v.yaw);
+    for (const [x, y] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) maxCornerD = Math.max(maxCornerD, Math.abs(v.d + x * CAR.length / 2 * sy + y * 1.1 * cy));
+  }
+  road.height = flatHeight;
+  assert(v.susp.ft.every(f => f > 0) && maxGap < 0.03, `Wheels must not float past the Armco while sliding: ${maxGap.toFixed(3)}`);
+  assert(v.crashed && maxCornerD < 9.05, `A sideways car must stop at the Armco, not pass through it: corner at d=${maxCornerD.toFixed(2)}`);
+  console.log({barrierSlideMaxFloatM: +maxGap.toFixed(3), barrierSlideMaxCornerD: +maxCornerD.toFixed(2)});
+}
+
 // Left/right symmetry, short taps, reversal and release: use actual steering input.
 for (const speed of [5, 20, 100, 200, 300, 350]) {
   const left = vehicle(speed), right = vehicle(speed);
