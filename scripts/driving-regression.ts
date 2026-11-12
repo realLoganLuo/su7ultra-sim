@@ -57,22 +57,23 @@ console.log({embStop200:{metres:+embStop.metres.toFixed(1),seconds:+embStop.seco
   const hit = (kmh: number, deg: number, seconds = 6) => {
     const v = vehicle(kmh), a = deg / 57.3;
     v.yaw = a; v.lane.d = 9 - 2.8 * Math.sin(a) - 1.03 * Math.cos(a) - 0.05; // a moment before the left rail
-    const ke0 = ke(v); let keMax = 0, pen = 0, maxFloat = 0, minV = Infinity, vAt1s = 0, stopT = Infinity;
+    const ke0 = ke(v); let keMax = 0, pen = 0, penFirst = 0, wreckedFirst = false, maxFloat = 0, minV = Infinity, vAt1s = 0, stopT = Infinity;
     for (let i = 0; i < seconds * 120; i++) {
       v.step(dt, {throttle:0, brake:0, steer:0});
       keMax = Math.max(keMax, ke(v));
       const cy = Math.cos(v.yaw), sy = Math.sin(v.yaw);
       for (const [x, y] of BODY_CORNERS) pen = Math.max(pen, Math.abs(v.d + x * sy + y * cy) - 9);
+      if (i < 180) { penFirst = pen; wreckedFirst = v.crashed; } // the first contact (a car with bent wheels drifts on afterwards)
       const ground = (v as unknown as { rPrev: number[] }).rPrev;
       maxFloat = Math.max(maxFloat, ...v.susp.u.map((u, k) => u - ground[k]));
       minV = Math.min(minV, v.v);
       if (i === 119) vAt1s = Math.hypot(v.v, v.lateralSpeed);
       if (stopT === Infinity && Math.hypot(v.v, v.lateralSpeed) < 0.5) stopT = i * dt;
     }
-    return { v, ke0, keMax, pen, maxFloat, minV, vAt1s, stopT };
+    return { v, ke0, keMax, pen, penFirst, wreckedFirst, maxFloat, minV, vAt1s, stopT };
   };
   const graze = hit(200, 3), angled = hit(120, 30), headOn = hit(60, 90, 2);
-  assert(!graze.v.crashed && graze.vAt1s > 0.85 * 200 / 3.6 && graze.pen < 0.15, `A 3 deg graze at 200 km/h scrapes and carries on: ${graze.vAt1s.toFixed(1)} m/s, ${graze.pen.toFixed(2)} m`);
+  assert(!graze.wreckedFirst && graze.vAt1s > 0.85 * 200 / 3.6 && graze.penFirst < 0.15, `A 3 deg graze at 200 km/h scrapes and carries on: ${graze.vAt1s.toFixed(1)} m/s, ${graze.penFirst.toFixed(2)} m`);
   assert(angled.v.crashed && angled.pen > 0.3 && angled.pen < 1.0 && angled.stopT < 5, `A 30 deg hit at 120 km/h wrecks the car a short way into the rail: ${angled.pen.toFixed(2)} m, stops ${angled.stopT.toFixed(1)} s`);
   const rebound = -headOn.minV / (60 / 3.6);
   assert(rebound > 0.1 && rebound < 0.35, `Head-on restitution must be car-like (0.1-0.35): ${rebound.toFixed(2)}`);
@@ -85,7 +86,50 @@ console.log({embStop200:{metres:+embStop.metres.toFixed(1),seconds:+embStop.seco
   for (let i = 0; i < 360; i++) { spin.step(dt, {throttle:0, brake:0, steer:0}); spinKe = Math.max(spinKe, ke(spin)); }
   assert(spinKe <= spin0 * 1.001, `A spinning car must not gain kinetic energy: ${(spin0 / 1e3).toFixed(0)} -> ${(spinKe / 1e3).toFixed(0)} kJ`);
   road.height = flatHeight;
-  console.log({barrier: {grazeKeepsMs: +graze.vAt1s.toFixed(1), grazePenM: +graze.pen.toFixed(2), angledPenM: +angled.pen.toFixed(2), angledStopS: +angled.stopT.toFixed(1), headOnRestitution: +rebound.toFixed(2), damageKJ: [graze, angled, headOn].map(r => +(r.v.damageJ / 1e3).toFixed(0))}});
+  console.log({barrier: {grazeKeepsMs: +graze.vAt1s.toFixed(1), grazePenM: +graze.penFirst.toFixed(2), angledPenM: +angled.pen.toFixed(2), angledStopS: +angled.stopT.toFixed(1), headOnRestitution: +rebound.toFixed(2), damageKJ: [graze, angled, headOn].map(r => +(r.v.damageJ / 1e3).toFixed(0))}});
+}
+
+// Wheel damage changes how the car drives; car-to-car contact is a momentum-conserving impulse.
+{
+  const THREE3 = await import('three');
+  const { playerVsTraffic, TRAFFIC_BODY, Traffic } = await import('../src/game/Traffic');
+  type TC = import('../src/game/Traffic').TrafficCar;
+  const hands = (v: Vehicle, secs: number, throttle = 0.25) => { for (let i = 0; i < secs * 120; i++) v.step(dt, {throttle, brake:0, steer:0}); };
+  // a 1 deg toe on the right-front wheel pulls the car left (toe + = points left) but leaves it drivable
+  const toed = vehicle(100);
+  toed.wheelDmg[1].toe = 1 / 57.3; toed.damageWheels(0, 0, 0, 0, 0); // zero-energy call refreshes the damage state
+  hands(toed, 1.5);
+  assert(toed.d > 0.8 && toed.d < 4 && !toed.undrivable && !toed.crashed, `A 1 deg toe must pull the car without disabling it: ${toed.d.toFixed(2)} m`);
+  // a big hit right at a wheel tears it off: that corner drops onto its upright and drags the car round
+  const off = vehicle(100); const lost = off.damageWheels(1.56, -1.03, 0, 1, 150e3);
+  let drop = 0; for (let i = 0; i < 600; i++) { off.step(dt, {throttle:1, brake:0, steer:0}); drop = Math.min(drop, off.susp.q - off.susp.phi * 0.863 - off.susp.theta * 1.56); }
+  assert(lost.includes(1) && off.undrivable && off.crashed, 'A 150 kJ hit at the right-front wheel must tear it off and disable the car');
+  assert(-drop > 0.12 && -drop < 0.3 && off.d < -0.5 && off.v < 2 && [off.v, off.d, off.yaw].every(Number.isFinite), `Missing wheel: corner drop ${(-drop).toFixed(2)} m, dragged to d=${off.d.toFixed(1)}, v=${off.v.toFixed(1)}`);
+  // car to car
+  const tcar = (s: number, d: number, kmh: number): TC => ({ s, d, v: kmh / 3.6, mesh: new THREE3.Group(), wheels: [], hitTimer: 0, yaw: 0, w: 0, r: 0, lane: d, cruiseV: kmh / 3.6, mode: 'cruise', damageJ: 0, touching: false, pendingJ: 0 });
+  const traffic = Object.create(Traffic.prototype) as InstanceType<typeof Traffic>;
+  const mom = (v: Vehicle, c: TC) => { const [a, b] = v.roadVelocity(); return [CAR.mass * a + TRAFFIC_BODY.m * (c.v * Math.cos(c.yaw) - c.w * Math.sin(c.yaw)), CAR.mass * b + TRAFFIC_BODY.m * (c.v * Math.sin(c.yaw) + c.w * Math.cos(c.yaw))]; };
+  const crash = (v: Vehicle, c: TC, secs: number) => {
+    (traffic as unknown as { cars: TC[]; cones: unknown[] }).cars = [c]; (traffic as unknown as { cones: unknown[] }).cones = [];
+    let momErr = -1, rP = 0, rC = 0, e = 0;
+    for (let i = 0; i < secs * 120; i++) {
+      v.step(dt, {throttle:0, brake:0, steer:0}); traffic.update(dt);
+      const m0 = mom(v, c); const hit = playerVsTraffic(v, c, c.s - v.s);
+      if (hit && momErr < 0) { const m1 = mom(v, c); momErr = Math.hypot(m1[0] - m0[0], m1[1] - m0[1]) / Math.hypot(...m0); e = hit.energyJ; }
+      rP = Math.max(rP, Math.abs(v.yawRate)); rC = Math.max(rC, Math.abs(c.r));
+      if (momErr >= 0 && i > 60 && Math.abs(v.d) > 7) break; // stop before barrier hits muddy the comparison
+    }
+    return { momErr, rP, rC, e };
+  };
+  const rear = crash(vehicle(150), tcar(100 + 7.2, 0, 100), 1);
+  assert(rear.momErr >= 0 && rear.momErr < 1e-9 && rear.e > 1e3, `Rear-end impact must conserve momentum: err ${rear.momErr}`);
+  assert(rear.rP < 0.2 && rear.rC < 0.2, `A square rear-end pushes straight (no spin): ${(rear.rP * 57.3).toFixed(0)} / ${(rear.rC * 57.3).toFixed(0)} deg/s`);
+  const pit = crash(vehicle(140), tcar(100 + 7.0, -1.7, 100), 1.2);
+  assert(pit.rC > 1.0, `Hitting a car's rear corner spins it: ${(pit.rC * 57.3).toFixed(0)} deg/s`);
+  const side = vehicle(150); const sc = tcar(100 - 1.6, 2.3, 150); sc.mode = 'loose'; sc.w = -8; sc.yaw = -0.15;
+  const sideHit = crash(side, sc, 1.5);
+  assert(sideHit.rP > 1.5, `A hard hit on the rear quarter can make the player lose control: ${(sideHit.rP * 57.3).toFixed(0)} deg/s`);
+  console.log({wheelsAndCars: {toePullM: +toed.d.toFixed(2), wheelOffDropM: +(-drop).toFixed(2), wheelOffDraggedToD: +off.d.toFixed(1), rearEndKJ: +(rear.e / 1e3).toFixed(1), rearEndSpinDegS: +(Math.max(rear.rP, rear.rC) * 57.3).toFixed(1), pitSpinDegS: +(pit.rC * 57.3).toFixed(0), sideHitPlayerSpinDegS: +(sideHit.rP * 57.3).toFixed(0)}});
 }
 
 // Left/right symmetry, short taps, reversal and release: use actual steering input.
