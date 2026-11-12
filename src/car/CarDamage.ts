@@ -4,8 +4,8 @@
 // contact model computed. Every body vertex that sticks out past that plane is flattened onto it, with a
 // short smooth blend behind the plane and some crumple noise, limited to the rail's height band. A shallow
 // glancing hit therefore scrapes a whole flank flat by a few centimetres, a corner hit folds the corner in.
-// Small exterior parts near a hard hit tear off (handed to the debris system), side glass near it breaks,
-// and the closest wheel is bent (camber / toe).
+// Small exterior parts near a hard hit tear off (handed to the debris system), side glass near it breaks.
+// Wheel alignment and torn-off wheels follow the physical wheel damage of the Vehicle.
 import * as THREE from 'three';
 import type { CarModel } from './CarModel';
 import { WHEEL_POS } from './CarModel';
@@ -35,15 +35,14 @@ export class CarDamage {
   private saved = new Map<THREE.Mesh, Saved>();
   private torn: TornPart[] = [];
   private hidden: THREE.Object3D[] = [];
-  /** accumulated crush per wheel (rad of camber) */
-  private bend = [0, 0, 0, 0];
+  private wheelHandles: { i: number; steer: THREE.Group; spin: THREE.Group }[] = [];
   private tmpM = new THREE.Matrix4();
   private tmpInv = new THREE.Matrix4();
   private v = new THREE.Vector3();
 
   constructor(private car: CarModel) {}
 
-  get damaged() { return this.saved.size > 0 || this.torn.length > 0 || this.bend.some((b) => b !== 0); }
+  get damaged() { return this.saved.size > 0 || this.torn.length > 0; }
 
   /**
    * Deform the body for one impact. Returns exterior parts that tore off (now detached from the car,
@@ -148,24 +147,37 @@ export class CarDamage {
       }
     }
 
-    // 4. bend the nearest wheel: camber (top towards the body) and toe
-    let wi = -1, best = 1.6;
-    for (let i = 0; i < 4; i++) {
-      const w = WHEEL_POS[i];
-      const dd = Math.hypot(w.x - im.x, w.yL - im.yL);
-      if (dd < best) { best = dd; wi = i; }
-    }
-    if (wi >= 0 && im.energyJ > 4e3) {
-      this.bend[wi] = Math.min(0.28, this.bend[wi] + im.energyJ / 380e3);
-      const g = car.wheelGroups[wi];
-      const sideSign = WHEEL_POS[wi].left ? 1 : -1;
-      g.rotation.set(sideSign * this.bend[wi], sideSign * this.bend[wi] * 0.6 * (WHEEL_POS[wi].front ? 1 : -1), 0);
-    }
     return torn;
+  }
+
+  /**
+   * Tear a whole wheel (with its upright) off the car. Returns it at its world pose for the debris
+   * system; the car's steer / spin handles are replaced by placeholders until the repair.
+   */
+  detachWheel(i: number): THREE.Object3D {
+    const car = this.car;
+    const steer = car.steerGroups[i], spin = car.spinGroups[i];
+    this.torn.push({ obj: steer, parent: car.wheelGroups[i], local: steer.matrix.clone() });
+    this.wheelHandles.push({ i, steer, spin });
+    car.steerGroups[i] = new THREE.Group();
+    car.spinGroups[i] = new THREE.Group();
+    car.root.parent?.attach(steer);
+    return steer;
+  }
+
+  /** wheel alignment from the physical damage state: toe, camber, and a bent rim's wobble */
+  alignWheels(dmg: { toe: number; camber: number; runout: number; detached: boolean }[], spin: number[]) {
+    for (let i = 0; i < 4; i++) {
+      const d = dmg[i];
+      const side = WHEEL_POS[i].left ? 1 : -1;
+      this.car.wheelGroups[i].rotation.set(side * d.camber, d.toe + d.runout * 0.15 * Math.sin(spin[i]), 0);
+    }
   }
 
   /** undo everything (new car) */
   repair() {
+    for (const h of this.wheelHandles) { this.car.steerGroups[h.i] = h.steer; this.car.spinGroups[h.i] = h.spin; }
+    this.wheelHandles = [];
     for (const [m, s] of this.saved) {
       const a = m.geometry.attributes.position as THREE.BufferAttribute;
       (a.array as Float32Array).set(s.pos); a.needsUpdate = true;
@@ -181,7 +193,6 @@ export class CarDamage {
     this.torn = [];
     for (const h of this.hidden) h.visible = true;
     this.hidden = [];
-    this.bend.fill(0);
     for (const g of this.car.wheelGroups) g.rotation.set(0, 0, 0);
   }
 

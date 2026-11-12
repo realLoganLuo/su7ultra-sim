@@ -22,7 +22,7 @@ import { CameraRig, CAM_NAMES } from '../camera/CameraRig';
 import { Controls } from '../ui/Controls';
 import { Hud, HudState } from '../ui/Hud';
 import type { BrakeEvent, PanelCtx } from '../ui/types';
-import { Traffic } from './Traffic';
+import { Traffic, TrafficCar, playerVsTraffic } from './Traffic';
 import { Scenarios, BrakeResult, MooseResult } from './Scenarios';
 import { LapTimer, fmtTime } from './LapTimer';
 import { Debris } from './Debris';
@@ -278,6 +278,7 @@ export class Game {
     this.newCar();
     this.debris.clear();
     this.track.repairArmco();
+    this.traffic.repair();
   }
 
   enterMenu() {
@@ -553,16 +554,13 @@ export class Game {
         this.notify('撞倒锥桶  +2 s', 'warn');
       }
     }
-    for (const car of this.traffic.cars) {
-      if (car.hitTimer > 0) continue;
-      const ds = dsOf(car.s);
-      if (Math.abs(ds) < 4.8 && Math.abs(car.d - p.d) < 1.95) {
-        car.hitTimer = 3;
-        this.lap.addPenalty(5);
-        p.v = Math.min(p.v, car.v * 0.75);
-        this.notify('碰撞慢车  +5 s', 'warn');
-      }
-    }
+    for (const car of this.traffic.cars) this.carContact(car, dsOf(car.s));
+  }
+
+  /** rigid-body contact between the player and one traffic car (see playerVsTraffic) */
+  private carContact(car: TrafficCar, ds: number) {
+    const r = playerVsTraffic(this.player, car, ds);
+    if (r && r.fresh && car.hitTimer <= 0 && r.energyJ > 1500) { this.lap.addPenalty(5); car.hitTimer = 3; }
   }
 
   private notify(text: string, kind: '' | 'warn' | 'good') {
@@ -639,6 +637,7 @@ export class Game {
       model.setBrakeGlow(i, veh.tel.brakeFrac[i] ?? 0, temp);
     }
     model.setSteer(pose.steer);
+    if (model === this.car) this.damage.alignWheels(veh.wheelDmg, pose.spin);
     model.setWingAngle(veh.wingAngle);
     model.setBrakeLights(veh.brakeLightLevel);
   }
@@ -833,12 +832,13 @@ export class Game {
 
   private applyImpact(im: Impact) {
     const torn = this.damage.apply(im);
-    this.track.bendArmco(im.s, im.side, im.railBend);
+    if (im.kind === 'barrier') this.track.bendArmco(im.s, im.side, im.railBend);
+    for (const wi of im.detached) torn.push(this.damage.detachWheel(wi));
     // world-space contact point and velocities
     const w = this.tmpW;
     road.frame(im.s, 0, w.o, w.f, w.l, w.n);
     const at = this.car.root.localToWorld(new THREE.Vector3(im.x, 0.55, -im.yL));
-    const intoTrack = w.l.clone().multiplyScalar(-im.side);
+    const intoTrack = w.f.clone().multiplyScalar(im.nS).addScaledVector(w.l, im.nD);
     const base = w.f.clone().multiplyScalar(0.85 * im.slideSpeed).addScaledVector(w.l, 0.2 * im.vD);
     const spray = intoTrack.multiplyScalar(1 + 0.35 * im.normalSpeed);
     for (const part of torn) {
@@ -847,8 +847,18 @@ export class Game {
     }
     const n = Math.round(Math.min(40, Math.max(2, im.energyJ / 2500)));
     this.debris.spawnFragments(n, at, base, spray, im.energyJ > 25e3 ? [0, 1, 0, 1, 2] : [0, 1], im.s);
+    const what = im.kind === 'car' ? '车辆' : '护栏';
+    const wheelNames = ['左前', '右前', '左后', '右后'];
+    if (im.detached.length) this.hud.toast(`${im.detached.map((i) => wheelNames[i]).join('、')}车轮脱落`, 'warn', 4000);
     if (im.wrecked) this.hud.toast(`严重撞击 · 车辆报废（吸收 ${(im.energyJ / 1000).toFixed(0)} kJ）`, 'warn', 4000);
-    else if (im.energyJ > 15e3) this.notify(`撞击护栏 · 车身受损（${(im.energyJ / 1000).toFixed(0)} kJ）`, 'warn');
-    else this.notify('擦碰护栏', 'warn');
+    else if (im.energyJ > 15e3) this.notify(`撞击${what} · 车身受损（${(im.energyJ / 1000).toFixed(0)} kJ）`, 'warn');
+    else this.notify(`擦碰${what}`, 'warn');
+    // tell the driver what the damage does to the car
+    const bent = this.player.wheelDmg.map((d, i) => ({ i, d })).filter((x) => !x.d.detached && Math.abs(x.d.toe) > 0.004);
+    if (!this.player.crashed && bent.length) {
+      const worst = bent.sort((a, b) => Math.abs(b.d.toe) - Math.abs(a.d.toe))[0];
+      const deg = (Math.abs(worst.d.toe) * 57.3).toFixed(1);
+      this.hud.toast(`${wheelNames[worst.i]}车轮受损 · 前束偏 ${deg}° · 方向会跑偏`, 'warn', 3500);
+    }
   }
 }
