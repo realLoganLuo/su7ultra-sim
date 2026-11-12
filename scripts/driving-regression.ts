@@ -48,25 +48,44 @@ assert(embStop.rearMin > 0.07 && embStop.rearMax < 0.15, `EMB rear slip must sta
 assert(embStop.metres < hydStop * 1.05, `EMB 200-0 (${embStop.metres.toFixed(1)} m) must be within 5 % of hydraulic (${hydStop.toFixed(1)} m)`);
 console.log({embStop200:{metres:+embStop.metres.toFixed(1),seconds:+embStop.seconds.toFixed(2),rearSlip:[+embStop.rearMin.toFixed(3),+embStop.rearMax.toFixed(3)]},hydStop200:+hydStop.toFixed(1)});
 
-// A car sliding sideways along the barrier has yawed corners past the Armco line, where the
-// terrain drops away. Those wheels must not hang over the drop (they used to float ~20 cm).
+// Armco impacts are rigid-body contacts with a compliant, elastic-plastic rail (src/physics/Barrier.ts).
 {
+  const { BODY_CORNERS } = await import('../src/physics/Barrier');
   const flatHeight = road.height;
-  road.height = (s, d) => (Math.abs(d) > 9.05 ? -0.6 : 0);
-  const v = vehicle(150); v.lane.d = 7.7; v.yaw = 1.05; // ~60 deg slide, centre still inside the crash limit
-  let maxGap = 0, maxCornerD = 0;
-  for (let i = 0; i < 24; i++) {
-    v.step(dt, {throttle:0, brake:0, steer:0});
-    // hub height above the ground under that wheel; about -2 cm (tyre deflection) when in contact
-    const ground = (v as unknown as { rPrev: number[] }).rPrev;
-    maxGap = Math.max(maxGap, ...v.susp.u.map((u, k) => u - ground[k]));
-    const cy = Math.cos(v.yaw), sy = Math.sin(v.yaw);
-    for (const [x, y] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) maxCornerD = Math.max(maxCornerD, Math.abs(v.d + x * CAR.length / 2 * sy + y * 1.1 * cy));
+  road.height = (s, d) => (Math.abs(d) > 9 ? -0.3 * (Math.abs(d) - 9) : 0); // terrain falls away behind the rail
+  const ke = (v: Vehicle) => 0.5 * CAR.mass * (v.v ** 2 + v.lateralSpeed ** 2) + 0.5 * CAR.yawInertia * v.yawRate ** 2;
+  const hit = (kmh: number, deg: number, seconds = 6) => {
+    const v = vehicle(kmh), a = deg / 57.3;
+    v.yaw = a; v.lane.d = 9 - 2.8 * Math.sin(a) - 1.03 * Math.cos(a) - 0.05; // a moment before the left rail
+    const ke0 = ke(v); let keMax = 0, pen = 0, maxFloat = 0, minV = Infinity, vAt1s = 0, stopT = Infinity;
+    for (let i = 0; i < seconds * 120; i++) {
+      v.step(dt, {throttle:0, brake:0, steer:0});
+      keMax = Math.max(keMax, ke(v));
+      const cy = Math.cos(v.yaw), sy = Math.sin(v.yaw);
+      for (const [x, y] of BODY_CORNERS) pen = Math.max(pen, Math.abs(v.d + x * sy + y * cy) - 9);
+      const ground = (v as unknown as { rPrev: number[] }).rPrev;
+      maxFloat = Math.max(maxFloat, ...v.susp.u.map((u, k) => u - ground[k]));
+      minV = Math.min(minV, v.v);
+      if (i === 119) vAt1s = Math.hypot(v.v, v.lateralSpeed);
+      if (stopT === Infinity && Math.hypot(v.v, v.lateralSpeed) < 0.5) stopT = i * dt;
+    }
+    return { v, ke0, keMax, pen, maxFloat, minV, vAt1s, stopT };
+  };
+  const graze = hit(200, 3), angled = hit(120, 30), headOn = hit(60, 90, 2);
+  assert(!graze.v.crashed && graze.vAt1s > 0.85 * 200 / 3.6 && graze.pen < 0.15, `A 3 deg graze at 200 km/h scrapes and carries on: ${graze.vAt1s.toFixed(1)} m/s, ${graze.pen.toFixed(2)} m`);
+  assert(angled.v.crashed && angled.pen > 0.3 && angled.pen < 1.0 && angled.stopT < 5, `A 30 deg hit at 120 km/h wrecks the car a short way into the rail: ${angled.pen.toFixed(2)} m, stops ${angled.stopT.toFixed(1)} s`);
+  const rebound = -headOn.minV / (60 / 3.6);
+  assert(rebound > 0.1 && rebound < 0.35, `Head-on restitution must be car-like (0.1-0.35): ${rebound.toFixed(2)}`);
+  for (const [name, r] of [['graze', graze], ['angled', angled], ['head-on', headOn]] as const) {
+    assert(r.keMax <= r.ke0 * 1.001, `${name}: a barrier impact must never add kinetic energy (${(r.ke0 / 1e3).toFixed(0)} -> ${(r.keMax / 1e3).toFixed(0)} kJ)`);
+    assert(r.maxFloat < 0.03, `${name}: wheels must not float past the Armco: ${r.maxFloat.toFixed(3)} m`);
   }
+  // Spinning without a wall: the body-frame equations only exchange speed between the axes.
+  const spin = vehicle(150); spin.yawRate = 4; let spinKe = ke(spin); const spin0 = spinKe;
+  for (let i = 0; i < 360; i++) { spin.step(dt, {throttle:0, brake:0, steer:0}); spinKe = Math.max(spinKe, ke(spin)); }
+  assert(spinKe <= spin0 * 1.001, `A spinning car must not gain kinetic energy: ${(spin0 / 1e3).toFixed(0)} -> ${(spinKe / 1e3).toFixed(0)} kJ`);
   road.height = flatHeight;
-  assert(v.susp.ft.every(f => f > 0) && maxGap < 0.03, `Wheels must not float past the Armco while sliding: ${maxGap.toFixed(3)}`);
-  assert(v.crashed && maxCornerD < 9.05, `A sideways car must stop at the Armco, not pass through it: corner at d=${maxCornerD.toFixed(2)}`);
-  console.log({barrierSlideMaxFloatM: +maxGap.toFixed(3), barrierSlideMaxCornerD: +maxCornerD.toFixed(2)});
+  console.log({barrier: {grazeKeepsMs: +graze.vAt1s.toFixed(1), grazePenM: +graze.pen.toFixed(2), angledPenM: +angled.pen.toFixed(2), angledStopS: +angled.stopT.toFixed(1), headOnRestitution: +rebound.toFixed(2), damageKJ: [graze, angled, headOn].map(r => +(r.v.damageJ / 1e3).toFixed(0))}});
 }
 
 // Left/right symmetry, short taps, reversal and release: use actual steering input.
