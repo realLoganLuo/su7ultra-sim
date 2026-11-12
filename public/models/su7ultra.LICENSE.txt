@@ -1,0 +1,11 @@
+Model Information:
+* title:	Xiaomi Su7 Ultra Nurburgring
+* source:	https://sketchfab.com/3d-models/xiaomi-su7-ultra-nurburgring-df6d8c7af9764d31a4ecef61925c13bb
+* author:	MattDoesBlender (https://sketchfab.com/MattDoesBlender)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Xiaomi Su7 Ultra Nurburgring" (https://sketchfab.com/3d-models/xiaomi-su7-ultra-nurburgring-df6d8c7af9764d31a4ecef61925c13bb) by MattDoesBlender (https://sketchfab.com/MattDoesBlender) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

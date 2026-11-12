@@ -1,0 +1,7 @@
+node_modules
+dist
+release
+/model
+shots
+.playwright-mcp
+.DS_Store

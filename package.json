@@ -1,0 +1,65 @@
+{
+  "name": "su7ultra-sim",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "SU7 Ultra-inspired driving simulation: continuous steering, tyre grip, hydraulic ABS and suspension dynamics",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5173",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4173",
+    "test:sim": "tsx scripts/simtest.ts",
+    "test:driving": "tsx scripts/driving-regression.ts",
+    "app": "npm run build && electron .",
+    "dist:mac": "npm run build && electron-builder --mac --arm64 --x64",
+    "dist:win": "npm run build && electron-builder --win --x64"
+  },
+  "dependencies": {
+    "three": "0.169.0"
+  },
+  "devDependencies": {
+    "@types/three": "0.169.0",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "tsx": "4.19.2",
+    "typescript": "5.6.3",
+    "vite": "5.4.10"
+  },
+  "productName": "SU7 Ultra Sim",
+  "author": "LoganLuo",
+  "license": "MIT",
+  "main": "electron/main.cjs",
+  "build": {
+    "appId": "com.loganluo.su7ultrasim",
+    "productName": "SU7 Ultra Sim",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.racing-games",
+      "identity": null
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ],
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "afterPack": "electron/adhoc-sign.cjs"
+  }
+}
