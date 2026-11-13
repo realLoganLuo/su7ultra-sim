@@ -7,6 +7,8 @@ import { CAR } from '../config';
 import { BrakeSystem, BrakeInput, DelayLine, T_MAX } from './BrakeBase';
 import { PHYS_DT } from '../config';
 
+const gripTorque = (fz: number) => Math.max(1, CAR.tireMu * Math.max(0, fz) * CAR.wheelRadius);
+
 export class BrakeByWire extends BrakeSystem {
   readonly name = '48V 线控制动 (EMB)';
   readonly short = 'EMB';
@@ -14,17 +16,23 @@ export class BrakeByWire extends BrakeSystem {
   private delay = [0, 1, 2, 3].map(() => new DelayLine(PHYS_DT / 2, 0.3));
   private lag = [0, 0, 0, 0];
   private cap = [Infinity, Infinity, Infinity, Infinity];
+  private trim = [1, 1, 1, 1]; // ABS torque limit as a fraction of the estimated grip torque
+  private err = [0, 0, 0, 0];
   private absTimer = 0;
   private fzF = [5500, 5500, 5900, 5900];
   readonly dead = 0.073; // s
   readonly tau = 0.012; // s
   readonly absHz = 100;
   readonly slipTarget = 0.11;
+  readonly ki = 0.25; // trim change per 100 Hz tick per unit slip error
+  readonly kp = 2; // proportional trim per unit slip error
 
   reset() {
     this.delay.forEach((d) => d.fill(0));
     this.lag.fill(0);
     this.cap.fill(Infinity);
+    this.trim.fill(1);
+    this.err.fill(0);
     this.torque.fill(0);
     this.request.fill(0);
     this.absActive.fill(false);
@@ -48,7 +56,9 @@ export class BrakeByWire extends BrakeSystem {
       this.request[i] = Math.min(T_MAX[i], demand * (this.fzF[i] / sumFz));
       this.delay[i].push(this.request[i]);
     }
-    // ABS controller at 100 Hz
+    // ABS controller at 100 Hz: per-wheel PI slip trim on top of a live wheel-load
+    // feed-forward (same grip estimate the hydraulic model uses). Gains are normalised by
+    // the wheel's grip torque so the lightly loaded rear axle does not limit-cycle.
     this.absTimer += dt;
     const tick = 1 / this.absHz;
     if (this.absTimer >= tick) {
@@ -56,22 +66,29 @@ export class BrakeByWire extends BrakeSystem {
       for (let i = 0; i < 4; i++) {
         const slip = inp.slip[i];
         const delayed = this.delay[i].read(this.dead);
+        const grip = gripTorque(inp.fz[i]);
         if (!this.absActive[i]) {
           if (slip > 0.125 && inp.speed > 3 && delayed > 200) {
             this.absActive[i] = true;
-            this.cap[i] = this.lag[i] * 0.85;
+            this.trim[i] = Math.min(1.2, (this.lag[i] * 0.85) / grip);
+            this.err[i] = slip - this.slipTarget;
           }
         } else {
           const e = slip - this.slipTarget;
-          this.cap[i] -= 2600 * e;
-          if (slip > 0.2) this.cap[i] *= 0.9;
-          this.cap[i] = Math.max(0, Math.min(this.cap[i], T_MAX[i] * 1.2));
-          if (delayed < this.cap[i] * 0.7 || inp.speed < 2) {
+          this.err[i] = e;
+          this.trim[i] -= this.ki * e;
+          if (slip > 0.2) this.trim[i] *= 0.9;
+          this.trim[i] = Math.max(0, Math.min(this.trim[i], 1.2));
+          if (delayed < this.trim[i] * grip * 0.7 || inp.speed < 2) {
             this.absActive[i] = false;
-            this.cap[i] = Infinity;
           }
         }
       }
+    }
+    for (let i = 0; i < 4; i++) {
+      this.cap[i] = this.absActive[i]
+        ? gripTorque(inp.fz[i]) * Math.max(0, this.trim[i] - this.kp * this.err[i])
+        : Infinity;
     }
     // torque vectoring: brake the inside wheels during lateral transitions
     const tvMag = Math.min(1, Math.abs(inp.tv));

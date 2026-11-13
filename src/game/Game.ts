@@ -22,9 +22,14 @@ import { CameraRig, CAM_NAMES } from '../camera/CameraRig';
 import { Controls } from '../ui/Controls';
 import { Hud, HudState } from '../ui/Hud';
 import type { BrakeEvent, PanelCtx } from '../ui/types';
-import { Traffic } from './Traffic';
+import { Traffic, TrafficCar, TrafficHit, playerVsTraffic } from './Traffic';
 import { Scenarios, BrakeResult, MooseResult } from './Scenarios';
 import { LapTimer, fmtTime } from './LapTimer';
+import { Debris } from './Debris';
+import { CarDamage } from '../car/CarDamage';
+import type { Impact } from '../physics/Barrier';
+
+const PAINT_RGB = { lava: 0xf2b200, pearl: 0xeef0f2 } as const;
 
 export type Mode = 'menu' | 'showcase' | 'drive';
 
@@ -63,6 +68,9 @@ export class Game {
   car: CarModel;
   refCar: CarModel | null = null;
   rig3: SuspensionRig;
+  damage: CarDamage;
+  debris: Debris;
+  private sdTmp = { s: 0, d: 0 };
   player = new Vehicle({ emb: DEFAULTS.emb, active: DEFAULTS.activeSusp });
   ref = new Vehicle({ emb: false, active: false });
   ghostVisible = false;
@@ -87,6 +95,7 @@ export class Game {
   fps = 0;
   private overspeedLevel: 0 | 1 | 2 = 0;
   private advised = 0;
+  private firstCornerHinted = false;
   private autoRotate = true;
   paused = false; // debug / automation: render without advancing the simulation
   glbTpl: GlbTemplate | null = null;
@@ -171,6 +180,14 @@ export class Game {
     this.car = new CarModel();
     this.scene.add(this.car.root);
     this.rig3 = new SuspensionRig(this.car);
+    this.damage = new CarDamage(this.car);
+    this.debris = new Debris((x, z, sHint) => {
+      road.worldToSD(x, z, sHint, this.sdTmp);
+      const { s, d } = this.sdTmp;
+      // road, curbs and verges are the road surface; beyond them the terrain mesh
+      return { y: Math.abs(d) <= 22 ? road.height(s, d) : this.terrain.heightAt(x, z), s, d };
+    }, PAINT_RGB[this.paint]);
+    this.world.add(this.debris.group);
 
     // camera / ui
     this.camera.aspect = window.innerWidth / window.innerHeight;
@@ -250,7 +267,22 @@ export class Game {
     this.bloom.strength = world ? 0.45 : 0.22;
   }
 
+  /** a new car: undo body damage, torn parts go back on (fragments and bent rails stay where they are) */
+  private newCar() {
+    this.damage.repair();
+    this.debris.clearParts();
+  }
+
+  /** fresh session: the track is clean again */
+  private cleanTrack() {
+    this.newCar();
+    this.debris.clear();
+    this.track.repairArmco();
+    this.traffic.repair();
+  }
+
   enterMenu() {
+    this.cleanTrack();
     this.mode = 'menu';
     this.setWorldVisible(false);
     this.hud.setMenu(true);
@@ -320,6 +352,7 @@ export class Game {
     if (is(KEYS.xray)) { this.setXray(!this.xray); return; }
     if (is(KEYS.paint)) {
       this.paint = this.paint === 'lava' ? 'pearl' : 'lava';
+      this.debris.setPaint(PAINT_RGB[this.paint]);
       this.car.setPaint(this.paint);
       if (this.mode === 'drive') this.hud.toast(`涂装：${this.paint === 'lava' ? '熔岩黄' : '珍珠白 + 黄色条纹'}`);
       return;
@@ -376,6 +409,7 @@ export class Game {
 
   // ------------------------------------------------------------------ resets / teleports
   resetAll(start = false) {
+    this.cleanTrack();
     this.acc = 0;
     this.player.reset(start ? 6 : this.player.s, start ? 0 : this.player.laneIdx, 0);
     this.ref.reset(this.player.s, 0, 0);
@@ -386,6 +420,7 @@ export class Game {
   }
 
   resetToCheckpoint() {
+    this.newCar();
     const p = this.player;
     const cp = Math.floor(p.s / 500) * 500;
     const crashed = p.crashed;
@@ -399,6 +434,7 @@ export class Game {
   }
 
   teleportBrakeTest() {
+    this.newCar();
     const p = this.player;
     const s = this.scen.zoneStart + 5;
     this.traffic.clearArea(s, 200, 900);
@@ -412,6 +448,7 @@ export class Game {
   }
 
   teleportMoose() {
+    this.newCar();
     const p = this.player;
     const s = this.scen.mooseStart - 150;
     this.traffic.clearArea(s, 200, 600);
@@ -461,7 +498,8 @@ export class Game {
     const p = this.player;
     p.step(dt, inp);
     this.ref.step(dt, inp);
-    this.traffic.update(dt);
+    const [pvS] = p.roadVelocity();
+    this.traffic.update(dt, [{ s: p.s, d: p.d, vS: pvS, half: 1.03 * Math.abs(Math.cos(p.yaw)) + 2.6 * Math.abs(Math.sin(p.yaw)) }]);
 
     // brake statistics (player vs reference)
     this.trackBrakeEvent(this.brakeEv.player, p, this.brake);
@@ -491,6 +529,12 @@ export class Game {
     const vsHere = safeSpeed(p.s, p.d);
     this.overspeedLevel = p.v > vsHere * 0.98 ? 2 : p.v > vs * 0.97 && p.v > 20 ? 1 : 0;
 
+    // One gentle hint per page load: holding only W from the grid runs wide at the first bend (~6 s).
+    if (!this.firstCornerHinted && this.lap.laps === 0 && p.s > 30 && p.s < 100 && p.v > 20) {
+      this.firstCornerHinted = true;
+      this.hud.toast('前方连续弯道 · 用 A / D 转向跟随赛道，入弯前松开 W、按 S 减速', 'warn', 4500);
+    }
+
     // graph sampling at 60 Hz
     if (++this.simTick % 2 === 0) this.hud.sampleGraphs(this.panelCtx());
   }
@@ -511,16 +555,13 @@ export class Game {
         this.notify('撞倒锥桶  +2 s', 'warn');
       }
     }
-    for (const car of this.traffic.cars) {
-      if (car.hitTimer > 0) continue;
-      const ds = dsOf(car.s);
-      if (Math.abs(ds) < 4.8 && Math.abs(car.d - p.d) < 1.95) {
-        car.hitTimer = 3;
-        this.lap.addPenalty(5);
-        p.v = Math.min(p.v, car.v * 0.75);
-        this.notify('碰撞慢车  +5 s', 'warn');
-      }
-    }
+    for (const car of this.traffic.cars) this.carContact(car, dsOf(car.s));
+  }
+
+  /** rigid-body contact between the player and one traffic car (see playerVsTraffic) */
+  private carContact(car: TrafficCar, ds: number) {
+    const r = playerVsTraffic(this.traffic, this.player, car, ds);
+    if (r && r.fresh && car.hitTimer <= 0 && r.energyJ > 1500) { this.lap.addPenalty(5); car.hitTimer = 3; }
   }
 
   private notify(text: string, kind: '' | 'warn' | 'good') {
@@ -597,6 +638,7 @@ export class Game {
       model.setBrakeGlow(i, veh.tel.brakeFrac[i] ?? 0, temp);
     }
     model.setSteer(pose.steer);
+    if (model === this.car) this.damage.alignWheels(veh.wheelDmg, pose.spin);
     model.setWingAngle(veh.wingAngle);
     model.setBrakeLights(veh.brakeLightLevel);
   }
@@ -645,7 +687,7 @@ export class Game {
     out('player', this.car, this.player);
     if (this.refCar && this.ghostVisible) out('ghost', this.refCar, this.ref);
     if (this.refCar && this.ghostVisible) wheelsOf(this.refCar, 'ghost', this.ref.s);
-    for (const c of this.traffic.cars) for (const w of c.wheels) this.addGap('traffic', tyreGap(c.mesh, w, 0.33, c.s));
+    for (const c of this.traffic.cars) c.wheels.forEach((w, k) => { if (!c.wheelOff[k]) this.addGap('traffic', tyreGap(c.mesh, w, 0.33, c.s)); });
   }
   /** showroom pose: tyre bottoms against the floor plane y = 0 */
   sampleShowroomGaps() {
@@ -726,7 +768,7 @@ export class Game {
     return {
       section: road.sectionAt(p.s).name,
       lapTime: this.lap.lapTime, bestLap: this.lap.bestLap, lastLap: this.lap.lastLap, penalty: this.lap.penalty, laps: this.lap.laps,
-      kmh: p.v * 3.6, powerKW: p.tel.powerKW, throttle: this.throttle, brake: this.brake,
+      kmh: Math.abs(p.v) * 3.6, powerKW: p.tel.powerKW, throttle: this.throttle, brake: this.brake,
       ayG: p.tel.ayG, axG: p.tel.axG, emb: p.opts.emb, active: p.opts.active, ghost: this.ghostVisible, xray: this.xray,
       cam: CAM_NAMES[this.rig.mode], paint: this.paint === 'lava' ? '熔岩黄' : '珍珠白', overspeed: this.overspeedLevel,
       advisedKmh: this.advised, crashed: p.crashed, inBrakeZone: this.scen.inBrakeZone(p.s), fps: this.fps,
@@ -756,6 +798,8 @@ export class Game {
         steps++;
       }
       if (steps >= 16) this.acc %= PHYS_DT;
+      this.handleImpacts();
+      this.debris.update(dt);
       this.hud.update(this.hudState(), this.panelCtx(), dt);
     }
     this.updateQuality(dt);
@@ -771,6 +815,72 @@ export class Game {
         this.syncVisuals(true);
         this.sampleGaps();
       }
+      if (this.player.impacts.length || this.traffic.hits.length) this.handleImpacts();
+    }
+  }
+
+  // ------------------------------------------------------------------ crash damage
+  private tmpW = { o: new THREE.Vector3(), f: new THREE.Vector3(), l: new THREE.Vector3(), n: new THREE.Vector3() };
+
+  /** turn the physics' barrier impacts into visible damage, debris, a bent rail and feedback */
+  private handleImpacts() {
+    this.ref.impacts.length = 0; // the ghost car only shows the reference run, it does not get damaged
+    const list = this.player.impacts.splice(0);
+    if (list.length) {
+      this.syncCar(this.car, this.player);
+      for (const im of list) this.applyImpact(im);
+    }
+    const hits = this.traffic.hits.splice(0);
+    if (hits.length) {
+      this.traffic.syncMeshes();
+      for (const h of hits) this.applyTrafficHit(h);
+    }
+  }
+
+  /** a traffic car was hit (by the player, another car or the rail): crumple it, shed wheels and debris */
+  private applyTrafficHit(h: TrafficHit) {
+    const wheels = this.traffic.applyHit(h);
+    if (h.kind === 'barrier') this.track.bendArmco(h.s, h.side, h.crush * 0.8);
+    const w = this.tmpW;
+    road.frame(h.s, 0, w.o, w.f, w.l, w.n);
+    const at = h.car.mesh.localToWorld(new THREE.Vector3(h.x, 0.6, -h.yL));
+    const base = w.f.clone().multiplyScalar(0.85 * h.vS).addScaledVector(w.l, 0.5 * h.vD);
+    // fragments leave away from the body (opposite to the push direction)
+    const out = new THREE.Vector3(-h.nx, 0, h.nyL).transformDirection(h.car.mesh.matrixWorld).multiplyScalar(2 + 6 * h.crush);
+    for (const part of wheels) this.debris.addPart(part, base.clone().addScaledVector(out, 0.5 + Math.random()).add(new THREE.Vector3(0, 2 + Math.random() * 2, 0)), h.s, 'traffic');
+    const n = Math.round(Math.min(16, h.energyJ / 5000));
+    if (n > 0) this.debris.spawnFragments(n, at, base, out, h.energyJ > 20e3 ? [1, 1, 2] : [1], h.s);
+  }
+
+  private applyImpact(im: Impact) {
+    const torn = this.damage.apply(im);
+    if (im.kind === 'barrier') this.track.bendArmco(im.s, im.side, im.railBend);
+    for (const wi of im.detached) torn.push(this.damage.detachWheel(wi));
+    // world-space contact point and velocities
+    const w = this.tmpW;
+    road.frame(im.s, 0, w.o, w.f, w.l, w.n);
+    const at = this.car.root.localToWorld(new THREE.Vector3(im.x, 0.55, -im.yL));
+    const intoTrack = w.f.clone().multiplyScalar(im.nS).addScaledVector(w.l, im.nD);
+    const base = w.f.clone().multiplyScalar(0.85 * im.slideSpeed).addScaledVector(w.l, 0.2 * im.vD);
+    const spray = intoTrack.multiplyScalar(1 + 0.35 * im.normalSpeed);
+    for (const part of torn) {
+      const v = base.clone().addScaledVector(spray, 0.5 + Math.random()).add(new THREE.Vector3(0, 2 + Math.random() * 3, 0));
+      this.debris.addPart(part, v, im.s);
+    }
+    const n = Math.round(Math.min(40, Math.max(2, im.energyJ / 2500)));
+    this.debris.spawnFragments(n, at, base, spray, im.energyJ > 25e3 ? [0, 1, 0, 1, 2] : [0, 1], im.s);
+    const what = im.kind === 'car' ? '车辆' : '护栏';
+    const wheelNames = ['左前', '右前', '左后', '右后'];
+    if (im.detached.length) this.hud.toast(`${im.detached.map((i) => wheelNames[i]).join('、')}车轮脱落`, 'warn', 4000);
+    if (im.wrecked) this.hud.toast(`严重撞击 · 车辆报废（吸收 ${(im.energyJ / 1000).toFixed(0)} kJ）`, 'warn', 4000);
+    else if (im.energyJ > 15e3) this.notify(`撞击${what} · 车身受损（${(im.energyJ / 1000).toFixed(0)} kJ）`, 'warn');
+    else this.notify(`擦碰${what}`, 'warn');
+    // tell the driver what the damage does to the car
+    const bent = this.player.wheelDmg.map((d, i) => ({ i, d })).filter((x) => !x.d.detached && Math.abs(x.d.toe) > 0.004);
+    if (!this.player.crashed && bent.length) {
+      const worst = bent.sort((a, b) => Math.abs(b.d.toe) - Math.abs(a.d.toe))[0];
+      const deg = (Math.abs(worst.d.toe) * 57.3).toFixed(1);
+      this.hud.toast(`${wheelNames[worst.i]}车轮受损 · 前束偏 ${deg}° · 方向会跑偏`, 'warn', 3500);
     }
   }
 }

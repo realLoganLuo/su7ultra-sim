@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { road, RoadSurface } from './roadSurface';
 import { TRACK_CFG } from '../config';
 import { asphaltTexture, grassTexture, curbTexture, signTexture, graffitiTextures } from './textures';
@@ -48,6 +49,8 @@ export class Track {
   group = new THREE.Group();
   roadGroup = new THREE.Group();
   props = new THREE.Group();
+  /** Armco segments with per-vertex track position, so impacts can bend the rail where they happen */
+  private armco: { mesh: THREE.Mesh; s0: number; s1: number; vs: Float32Array; side: Int8Array; orig: Float32Array; bent: boolean }[] = [];
   rs = road;
 
   constructor() {
@@ -88,20 +91,76 @@ export class Track {
     const uvCurb: UVFn = (s, d) => [Math.abs(d) > 0 ? (Math.abs(d) - hw) / 1.4 : 0, s / 3];
     const uvGrass: UVFn = (s, d) => [d / 12, s / 12];
 
+    // One mesh per material per chunk: left and right curbs / grass share the same s-range, so merging
+    // them halves their draw calls without coarsening frustum culling.
+    const merged = (parts: THREE.BufferGeometry[]) => {
+      const g = mergeGeometries(parts)!;
+      parts.forEach((x) => x.dispose());
+      g.computeBoundingSphere();
+      return g;
+    };
     for (const ch of this.chunks()) {
       const m = new THREE.Mesh(buildRibbon(rs, ch.s0, ch.s1, roadCols, uvRoad, 0), ch.concrete ? concrete : asphalt);
       m.receiveShadow = true;
       this.roadGroup.add(m);
+      const curbs: THREE.BufferGeometry[] = [], grasses: THREE.BufferGeometry[] = [];
       for (const sgn of [-1, 1]) {
         const cols = sgn > 0 ? [hw, (hw + TRACK_CFG.curbOuter) / 2, TRACK_CFG.curbOuter] : [-TRACK_CFG.curbOuter, -(hw + TRACK_CFG.curbOuter) / 2, -hw];
-        const cm = new THREE.Mesh(buildRibbon(rs, ch.s0, ch.s1, cols, uvCurb, 0.004), curb);
-        cm.receiveShadow = true;
-        this.roadGroup.add(cm);
+        curbs.push(buildRibbon(rs, ch.s0, ch.s1, cols, uvCurb, 0.004));
         const gcols = sgn > 0 ? [TRACK_CFG.curbOuter, 9, 12, 16, 22] : [-22, -16, -12, -9, -TRACK_CFG.curbOuter];
-        const gm = new THREE.Mesh(buildRibbon(rs, ch.s0, ch.s1, gcols, uvGrass, -0.003, 2), grass);
-        gm.receiveShadow = true;
-        this.roadGroup.add(gm);
+        grasses.push(buildRibbon(rs, ch.s0, ch.s1, gcols, uvGrass, -0.003, 2));
       }
+      const cm = new THREE.Mesh(merged(curbs), curb);
+      cm.receiveShadow = true;
+      this.roadGroup.add(cm);
+      const gm = new THREE.Mesh(merged(grasses), grass);
+      gm.receiveShadow = true;
+      this.roadGroup.add(gm);
+    }
+  }
+
+  /**
+   * Permanently bend the Armco outwards after an impact: `depth` metres at s, fading along the rail over a
+   * length that grows with the depth (a hard hit drags more of the rail and its posts with it).
+   */
+  bendArmco(s: number, side: 1 | -1, depth: number) {
+    if (depth < 0.005) return;
+    const L = this.rs.length;
+    const span = 1.2 + 4 * depth;
+    for (const seg of this.armco) {
+      const ds0 = ((s - seg.s0 + L / 2) % L + L) % L - L / 2, ds1 = ((s - seg.s1 + L / 2) % L + L) % L - L / 2;
+      if (ds0 < -3 * span || ds1 > 3 * span) continue;
+      const a = seg.mesh.geometry.attributes.position as THREE.BufferAttribute;
+      let touched = false;
+      for (let i = 0; i < a.count; i++) {
+        if (seg.side[i] !== side) continue;
+        let dd = seg.vs[i] - s;
+        dd = ((dd + L / 2) % L + L) % L - L / 2;
+        if (Math.abs(dd) > 3 * span) continue;
+        const push = depth * Math.exp(-((dd / span) ** 2));
+        const sv = seg.vs[i];
+        a.setXYZ(i, a.getX(i) + this.rs.lxAt(sv) * side * push, a.getY(i) - 0.15 * push, a.getZ(i) + this.rs.lzAt(sv) * side * push);
+        touched = true;
+      }
+      if (touched) {
+        a.needsUpdate = true;
+        seg.mesh.geometry.computeVertexNormals();
+        seg.mesh.geometry.computeBoundingSphere();
+        seg.bent = true;
+      }
+    }
+  }
+
+  /** straighten every bent rail (new session) */
+  repairArmco() {
+    for (const seg of this.armco) {
+      if (!seg.bent) continue;
+      const a = seg.mesh.geometry.attributes.position as THREE.BufferAttribute;
+      (a.array as Float32Array).set(seg.orig);
+      a.needsUpdate = true;
+      seg.mesh.geometry.computeVertexNormals();
+      seg.mesh.geometry.computeBoundingSphere();
+      seg.bent = false;
     }
   }
 
@@ -110,9 +169,12 @@ export class Track {
     const L = rs.length;
     const mat = new THREE.MeshStandardMaterial({ color: 0xb9c0c7, metalness: 0.65, roughness: 0.42, side: THREE.DoubleSide });
     const profile: [number, number][] = [[0.0, 0.3], [-0.04, 0.2], [0.0, 0.1], [0.03, 0.0], [0, -0.1], [-0.04, -0.2], [0, -0.3]]; // (toward road, height)
-    for (const sgn of [-1, 1]) {
-      for (let s0 = 0; s0 < L; s0 += 240) {
-        const s1 = Math.min(L, s0 + 240);
+    // both rails on both sides of a 240 m segment become one mesh (one draw call instead of four)
+    for (let s0 = 0; s0 < L; s0 += 240) {
+      const s1 = Math.min(L, s0 + 240);
+      const rails: THREE.BufferGeometry[] = [];
+      const vs: number[] = [], vside: number[] = [];
+      for (const sgn of [-1, 1]) {
         for (const hRail of [0.52, 0.86]) {
           const pos: number[] = [];
           const idx: number[] = [];
@@ -126,6 +188,7 @@ export class Track {
             for (const [off, h] of profile) {
               const dd = -sgn * off; // toward the road = -sgn direction
               pos.push(p.x + lx * dd, p.y + hRail + h, p.z + lz * dd);
+              vs.push(s); vside.push(sgn);
             }
           }
           const nv = profile.length;
@@ -137,11 +200,16 @@ export class Track {
           g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
           g.setIndex(idx);
           g.computeVertexNormals();
-          const m = new THREE.Mesh(g, mat);
-          m.castShadow = false;
-          this.props.add(m);
+          rails.push(g);
         }
       }
+      const g = mergeGeometries(rails)!;
+      rails.forEach((x) => x.dispose());
+      g.computeBoundingSphere();
+      const m = new THREE.Mesh(g, mat);
+      m.castShadow = false;
+      this.props.add(m);
+      this.armco.push({ mesh: m, s0, s1, vs: new Float32Array(vs), side: Int8Array.from(vside), orig: new Float32Array(g.attributes.position.array as Float32Array), bent: false });
     }
     // posts
     const postGeo = new THREE.BoxGeometry(0.12, 1.15, 0.14);

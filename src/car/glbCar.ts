@@ -169,6 +169,11 @@ export function instantiate(tpl: GlbTemplate): GlbInstance {
         mesh.material = m.clone();
         const tm = mesh.material as StdMat;
         tm.metalness = 0; tm.roughness = 0.25;
+        // The centre brake lamp ships with KHR transmission = 1. One visible transmissive material makes
+        // three.js re-render every opaque object (car, track, forest) into a transmission target each
+        // frame, roughly doubling draw calls; a dark tinted opaque lens looks the same at this size.
+        const phys = tm as THREE.MeshPhysicalMaterial;
+        if (phys.transmission > 0) { phys.transmission = 0; phys.color.set(0x2a0705); }
         tailMats.push(tm);
       }
     }
