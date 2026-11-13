@@ -22,7 +22,7 @@ import { CameraRig, CAM_NAMES } from '../camera/CameraRig';
 import { Controls } from '../ui/Controls';
 import { Hud, HudState } from '../ui/Hud';
 import type { BrakeEvent, PanelCtx } from '../ui/types';
-import { Traffic, TrafficCar, playerVsTraffic } from './Traffic';
+import { Traffic, TrafficCar, TrafficHit, playerVsTraffic } from './Traffic';
 import { Scenarios, BrakeResult, MooseResult } from './Scenarios';
 import { LapTimer, fmtTime } from './LapTimer';
 import { Debris } from './Debris';
@@ -498,7 +498,8 @@ export class Game {
     const p = this.player;
     p.step(dt, inp);
     this.ref.step(dt, inp);
-    this.traffic.update(dt);
+    const [pvS] = p.roadVelocity();
+    this.traffic.update(dt, [{ s: p.s, d: p.d, vS: pvS, half: 1.03 * Math.abs(Math.cos(p.yaw)) + 2.6 * Math.abs(Math.sin(p.yaw)) }]);
 
     // brake statistics (player vs reference)
     this.trackBrakeEvent(this.brakeEv.player, p, this.brake);
@@ -559,7 +560,7 @@ export class Game {
 
   /** rigid-body contact between the player and one traffic car (see playerVsTraffic) */
   private carContact(car: TrafficCar, ds: number) {
-    const r = playerVsTraffic(this.player, car, ds);
+    const r = playerVsTraffic(this.traffic, this.player, car, ds);
     if (r && r.fresh && car.hitTimer <= 0 && r.energyJ > 1500) { this.lap.addPenalty(5); car.hitTimer = 3; }
   }
 
@@ -686,7 +687,7 @@ export class Game {
     out('player', this.car, this.player);
     if (this.refCar && this.ghostVisible) out('ghost', this.refCar, this.ref);
     if (this.refCar && this.ghostVisible) wheelsOf(this.refCar, 'ghost', this.ref.s);
-    for (const c of this.traffic.cars) for (const w of c.wheels) this.addGap('traffic', tyreGap(c.mesh, w, 0.33, c.s));
+    for (const c of this.traffic.cars) c.wheels.forEach((w, k) => { if (!c.wheelOff[k]) this.addGap('traffic', tyreGap(c.mesh, w, 0.33, c.s)); });
   }
   /** showroom pose: tyre bottoms against the floor plane y = 0 */
   sampleShowroomGaps() {
@@ -814,7 +815,7 @@ export class Game {
         this.syncVisuals(true);
         this.sampleGaps();
       }
-      if (this.player.impacts.length) this.handleImpacts();
+      if (this.player.impacts.length || this.traffic.hits.length) this.handleImpacts();
     }
   }
 
@@ -825,9 +826,30 @@ export class Game {
   private handleImpacts() {
     this.ref.impacts.length = 0; // the ghost car only shows the reference run, it does not get damaged
     const list = this.player.impacts.splice(0);
-    if (!list.length) return;
-    this.syncCar(this.car, this.player);
-    for (const im of list) this.applyImpact(im);
+    if (list.length) {
+      this.syncCar(this.car, this.player);
+      for (const im of list) this.applyImpact(im);
+    }
+    const hits = this.traffic.hits.splice(0);
+    if (hits.length) {
+      this.traffic.syncMeshes();
+      for (const h of hits) this.applyTrafficHit(h);
+    }
+  }
+
+  /** a traffic car was hit (by the player, another car or the rail): crumple it, shed wheels and debris */
+  private applyTrafficHit(h: TrafficHit) {
+    const wheels = this.traffic.applyHit(h);
+    if (h.kind === 'barrier') this.track.bendArmco(h.s, h.side, h.crush * 0.8);
+    const w = this.tmpW;
+    road.frame(h.s, 0, w.o, w.f, w.l, w.n);
+    const at = h.car.mesh.localToWorld(new THREE.Vector3(h.x, 0.6, -h.yL));
+    const base = w.f.clone().multiplyScalar(0.85 * h.vS).addScaledVector(w.l, 0.5 * h.vD);
+    // fragments leave away from the body (opposite to the push direction)
+    const out = new THREE.Vector3(-h.nx, 0, h.nyL).transformDirection(h.car.mesh.matrixWorld).multiplyScalar(2 + 6 * h.crush);
+    for (const part of wheels) this.debris.addPart(part, base.clone().addScaledVector(out, 0.5 + Math.random()).add(new THREE.Vector3(0, 2 + Math.random() * 2, 0)), h.s, 'traffic');
+    const n = Math.round(Math.min(16, h.energyJ / 5000));
+    if (n > 0) this.debris.spawnFragments(n, at, base, out, h.energyJ > 20e3 ? [1, 1, 2] : [1], h.s);
   }
 
   private applyImpact(im: Impact) {

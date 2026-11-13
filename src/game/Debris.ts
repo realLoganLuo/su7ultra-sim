@@ -13,7 +13,7 @@ const MAX_FRAGMENTS = 160;
 interface Body {
   pos: THREE.Vector3; vel: THREE.Vector3; quat: THREE.Quaternion; ang: THREE.Vector3;
   r: number; scale: THREE.Vector3; sHint: number; sleeping: boolean; outside: boolean;
-  obj?: THREE.Object3D; kind?: number; slot?: number;
+  obj?: THREE.Object3D; kind?: number; slot?: number; owner?: string;
 }
 
 export type GroundFn = (x: number, z: number, sHint: number) => { y: number; s: number; d: number };
@@ -55,7 +55,7 @@ export class Debris {
   get count() { return this.parts.length + this.frags.length; }
 
   /** a real part that tore off the car: keeps its world pose and gets the contact-point velocity */
-  addPart(obj: THREE.Object3D, vel: THREE.Vector3, sHint: number) {
+  addPart(obj: THREE.Object3D, vel: THREE.Vector3, sHint: number, owner = 'player') {
     this.group.attach(obj);
     obj.updateMatrixWorld(true);
     const box = new THREE.Box3().setFromObject(obj);
@@ -68,7 +68,7 @@ export class Debris {
     pivot.updateMatrixWorld(true);
     pivot.attach(obj);
     const r = Math.max(0.02, Math.min(size.x, size.y, size.z) / 2);
-    this.parts.push({ pos, vel: vel.clone(), quat: new THREE.Quaternion(), ang: randAng(9), r, scale: new THREE.Vector3(1, 1, 1), sHint, sleeping: false, outside: false, obj: pivot });
+    this.parts.push({ pos, vel: vel.clone(), quat: new THREE.Quaternion(), ang: randAng(9), r, scale: new THREE.Vector3(1, 1, 1), sHint, sleeping: false, outside: false, obj: pivot, owner });
   }
 
   /** generated fragments around a world point */
@@ -96,10 +96,10 @@ export class Debris {
     for (let k = 0; k < this.inst.length; k++) { this.inst[k].count = 0; this.inst[k].visible = false; this.free[k] = []; }
   }
 
-  /** forget torn parts (a repair has put them back on the car) but keep the fragments on the track */
-  clearParts() {
-    for (const b of this.parts) b.obj!.removeFromParent();
-    this.parts = [];
+  /** forget one car's torn parts (a repair has put them back on) but keep everything else on the track */
+  clearParts(owner = 'player') {
+    for (const b of this.parts) if (b.owner === owner) b.obj!.removeFromParent();
+    this.parts = this.parts.filter((b) => b.owner !== owner);
   }
 
   update(dt: number) {
