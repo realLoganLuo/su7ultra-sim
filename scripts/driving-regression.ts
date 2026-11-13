@@ -91,8 +91,7 @@ console.log({embStop200:{metres:+embStop.metres.toFixed(1),seconds:+embStop.seco
 
 // Wheel damage changes how the car drives; car-to-car contact is a momentum-conserving impulse.
 {
-  const THREE3 = await import('three');
-  const { playerVsTraffic, TRAFFIC_BODY, Traffic } = await import('../src/game/Traffic');
+  const { playerVsTraffic, makeTrafficCar, TRAFFIC_BODY, Traffic } = await import('../src/game/Traffic');
   type TC = import('../src/game/Traffic').TrafficCar;
   const hands = (v: Vehicle, secs: number, throttle = 0.25) => { for (let i = 0; i < secs * 120; i++) v.step(dt, {throttle, brake:0, steer:0}); };
   // a 1 deg toe on the right-front wheel pulls the car left (toe + = points left) but leaves it drivable
@@ -106,15 +105,15 @@ console.log({embStop200:{metres:+embStop.metres.toFixed(1),seconds:+embStop.seco
   assert(lost.includes(1) && off.undrivable && off.crashed, 'A 150 kJ hit at the right-front wheel must tear it off and disable the car');
   assert(-drop > 0.12 && -drop < 0.3 && off.d < -0.5 && off.v < 2 && [off.v, off.d, off.yaw].every(Number.isFinite), `Missing wheel: corner drop ${(-drop).toFixed(2)} m, dragged to d=${off.d.toFixed(1)}, v=${off.v.toFixed(1)}`);
   // car to car
-  const tcar = (s: number, d: number, kmh: number): TC => ({ s, d, v: kmh / 3.6, mesh: new THREE3.Group(), wheels: [], hitTimer: 0, yaw: 0, w: 0, r: 0, lane: d, cruiseV: kmh / 3.6, mode: 'cruise', damageJ: 0, touching: false, pendingJ: 0 });
-  const traffic = Object.create(Traffic.prototype) as InstanceType<typeof Traffic>;
+  const tcar = (s: number, d: number, kmh: number): TC => makeTrafficCar(s, d, kmh / 3.6);
+  const traffic = new Traffic(0);
   const mom = (v: Vehicle, c: TC) => { const [a, b] = v.roadVelocity(); return [CAR.mass * a + TRAFFIC_BODY.m * (c.v * Math.cos(c.yaw) - c.w * Math.sin(c.yaw)), CAR.mass * b + TRAFFIC_BODY.m * (c.v * Math.sin(c.yaw) + c.w * Math.cos(c.yaw))]; };
   const crash = (v: Vehicle, c: TC, secs: number) => {
-    (traffic as unknown as { cars: TC[]; cones: unknown[] }).cars = [c]; (traffic as unknown as { cones: unknown[] }).cones = [];
+    traffic.cars = [c]; traffic.cones = []; traffic.hits = [];
     let momErr = -1, rP = 0, rC = 0, e = 0;
     for (let i = 0; i < secs * 120; i++) {
       v.step(dt, {throttle:0, brake:0, steer:0}); traffic.update(dt);
-      const m0 = mom(v, c); const hit = playerVsTraffic(v, c, c.s - v.s);
+      const m0 = mom(v, c); const hit = playerVsTraffic(traffic, v, c, c.s - v.s);
       if (hit && momErr < 0) { const m1 = mom(v, c); momErr = Math.hypot(m1[0] - m0[0], m1[1] - m0[1]) / Math.hypot(...m0); e = hit.energyJ; }
       rP = Math.max(rP, Math.abs(v.yawRate)); rC = Math.max(rC, Math.abs(c.r));
       if (momErr >= 0 && i > 60 && Math.abs(v.d) > 7) break; // stop before barrier hits muddy the comparison
@@ -130,6 +129,46 @@ console.log({embStop200:{metres:+embStop.metres.toFixed(1),seconds:+embStop.seco
   const sideHit = crash(side, sc, 1.5);
   assert(sideHit.rP > 1.5, `A hard hit on the rear quarter can make the player lose control: ${(sideHit.rP * 57.3).toFixed(0)} deg/s`);
   console.log({wheelsAndCars: {toePullM: +toed.d.toFixed(2), wheelOffDropM: +(-drop).toFixed(2), wheelOffDraggedToD: +off.d.toFixed(1), rearEndKJ: +(rear.e / 1e3).toFixed(1), rearEndSpinDegS: +(Math.max(rear.rP, rear.rC) * 57.3).toFixed(1), pitSpinDegS: +(pit.rC * 57.3).toFixed(0), sideHitPlayerSpinDegS: +(sideHit.rP * 57.3).toFixed(0)}});
+}
+
+// Traffic cars see each other: they follow, pass and stop without touching; when one is out of control
+// the car-to-car contact conserves momentum and damages both; a heavy hit sheds wheels.
+{
+  const { makeTrafficCar, TRAFFIC_BODY, Traffic } = await import('../src/game/Traffic');
+  type TC = import('../src/game/Traffic').TrafficCar;
+  const t = new Traffic(0); t.cones = [];
+  const car = (s: number, d: number, kmh: number) => makeTrafficCar(s, d, kmh / 3.6);
+  const run = (cars: TC[], secs: number) => {
+    t.cars = cars; t.hits = [];
+    let hits = 0, off = 0, momErr = 0; const kinds = new Set<string>();
+    const mom = () => cars.reduce((a, c) => { const cy = Math.cos(c.yaw), sy = Math.sin(c.yaw); return [a[0] + c.v * cy - c.w * sy, a[1] + c.v * sy + c.w * cy]; }, [0, 0]);
+    for (let i = 0; i < secs * 120; i++) {
+      const before = t.hits.length, m0 = mom();
+      (t as unknown as { carVsCar(): void }).carVsCar(); // contact alone, to compare momentum across it
+      if (t.hits.length > before) { const m1 = mom(); momErr = Math.max(momErr, Math.hypot(m1[0] - m0[0], m1[1] - m0[1]) / Math.hypot(...m0)); }
+      t.update(dt);
+      for (const h of t.hits) { hits++; off += h.wheelsOff.length; kinds.add(h.kind); }
+      t.hits.length = 0;
+    }
+    return { hits, off, momErr, kinds };
+  };
+  const fast = car(100, 0, 110), slow = car(160, 0, 60);
+  assert(run([fast, slow], 12).hits === 0 && fast.s > slow.s && Math.abs(fast.v - 110 / 3.6) < 0.5, 'A faster traffic car must pass a slower one without contact');
+  const wreck = car(250, 0, 0); wreck.mode = 'wrecked'; const comer = car(100, 0, 110);
+  assert(run([comer, wreck], 12).hits === 0 && comer.s > 260, 'Traffic must drive around a wreck in its lane');
+  const wall = [-4, 0, 4].map((d) => { const w = car(300, d, 0); w.mode = 'wrecked'; return w; }); const stopper = car(100, 0, 110);
+  assert(run([stopper, ...wall], 12).hits === 0 && stopper.v === 0 && stopper.s < 295, `With every lane blocked traffic must stop: s=${stopper.s.toFixed(0)} v=${stopper.v.toFixed(1)}`);
+  const a = car(100, 0, 120), b = car(109, 0.8, 30);
+  const pile = run([a, b], 8);
+  assert(pile.hits >= 2 && pile.momErr < 1e-9 && a.damageJ > TRAFFIC_BODY.wreckJ && b.damageJ > TRAFFIC_BODY.wreckJ && a.mode === 'wrecked', `A +90 km/h rear-end between traffic cars wrecks both and conserves momentum (err ${pile.momErr})`);
+  assert(pile.off >= 1, 'A heavy car-to-car hit must tear a wheel off');
+  const stray = car(100, 6, 110); stray.mode = 'loose'; stray.yaw = 0.5;
+  const rail = run([stray], 6);
+  assert(rail.kinds.has('barrier') && stray.mode === 'wrecked' && Math.abs(stray.d) < 9, 'A traffic car that hits the rail at speed is damaged by it');
+  const nudged = car(100, 0, 100); nudged.mode = 'loose'; nudged.r = 0.6; nudged.w = 1;
+  run([nudged], 8);
+  assert(nudged.mode === 'cruise' && Math.abs(nudged.d) < 0.1, 'A lightly knocked traffic car must recover and return to its lane');
+  console.log({traffic: {pileUpHits: pile.hits, pileUpWheelsOff: pile.off, pileUpDamageKJ: [a, b].map((c) => +(c.damageJ / 1e3).toFixed(0)), railDamageKJ: +(stray.damageJ / 1e3).toFixed(0)}});
 }
 
 // Left/right symmetry, short taps, reversal and release: use actual steering input.
